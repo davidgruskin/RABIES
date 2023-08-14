@@ -8,9 +8,10 @@ from nipype.interfaces.afni import Autobox
 from .inho_correction import init_inho_correction_wf
 from .commonspace_reg import init_commonspace_reg_wf
 from .bold_main_wf import init_bold_main_wf
-from .utils import BIDSDataGraber, prep_bids_iter, convert_to_RAS, resample_template
+from .utils import BIDSDataGraber, extract_entities, prep_bids_iter, convert_to_RAS, resample_template
 from . import preprocess_visual_QC
-
+from niworkflows.utils.connections import listify, pop_file
+import pdb
 def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
     '''
     This workflow organizes the entire processing.
@@ -136,6 +137,10 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
     layout = bids.layout.BIDSLayout(data_dir_path, validate=False)
     split_name, scan_info, run_iter, scan_list, bold_scan_list = prep_bids_iter(
         layout, opts.bold_only)
+    
+    entities = extract_entities(bold_scan_list)
+    echo_idxs = listify(entities.get("echo", []))
+    multiecho = len(echo_idxs) > 2
 
     # setting up all iterables
     main_split = pe.Node(niu.IdentityInterface(fields=['split_name', 'scan_info']),
