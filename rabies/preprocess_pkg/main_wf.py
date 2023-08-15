@@ -8,10 +8,21 @@ from nipype.interfaces.afni import Autobox
 from .inho_correction import init_inho_correction_wf
 from .commonspace_reg import init_commonspace_reg_wf
 from .bold_main_wf import init_bold_main_wf
-from .utils import BIDSDataGraber, extract_entities, prep_bids_iter, convert_to_RAS, resample_template
+from .utils import BIDSDataGraber, extract_entities, prep_bids_iter, convert_to_RAS, resample_template,BIDSDataGraberSingleEcho
 from . import preprocess_visual_QC
 from niworkflows.utils.connections import listify, pop_file
 import pdb
+import nibabel as nb
+import numpy as np 
+from niworkflows.utils.connections import pop_file, listify
+from nipype.interfaces.base import BaseInterface, BaseInterfaceInputSpec, traits, File, TraitedSpec
+
+from nipype.interfaces.base import BaseInterface, BaseInterfaceInputSpec, traits, File, TraitedSpec
+import ast
+import os
+
+
+    
 def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
     '''
     This workflow organizes the entire processing.
@@ -135,12 +146,8 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
     import bids
     bids.config.set_option('extension_initial_dot', True)
     layout = bids.layout.BIDSLayout(data_dir_path, validate=False)
-    split_name, scan_info, run_iter, scan_list, bold_scan_list = prep_bids_iter(
+    split_name, scan_info, run_iter,echo_iter, scan_list, bold_scan_list = prep_bids_iter(
         layout, opts.bold_only)
-    
-    entities = extract_entities(bold_scan_list)
-    echo_idxs = listify(entities.get("echo", []))
-    multiecho = len(echo_idxs) > 2
 
     # setting up all iterables
     main_split = pe.Node(niu.IdentityInterface(fields=['split_name', 'scan_info']),
@@ -149,10 +156,12 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                             ('scan_info', scan_info)]
     main_split.synchronize = True
 
-    bold_selectfiles = pe.Node(BIDSDataGraber(bids_dir=data_dir_path, suffix=[
-                               'bold', 'cbv']), name='bold_selectfiles')
 
-    # node to conver input image to consistent RAS orientation
+    #bold_selectfilessingle = pe.Node(BIDSDataGraber(bids_dir=data_dir_path, suffix=['bold', 'cbv']),
+    #                       name='bold_selectfilessingle')
+    bold_selectfilessingle = pe.Node(BIDSDataGraberSingleEcho(bids_dir=data_dir_path, suffix=['bold', 'cbv']),
+                           name='bold_selectfilessingle')
+    # node to convert input image to consistent RAS orientation
     bold_convert_to_RAS_node = pe.Node(Function(input_names=['img_file'],
                                                 output_names=['RAS_file'],
                                                 function=convert_to_RAS),
@@ -193,13 +202,14 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
 
     # calculate the number of scans that will be registered
     num_scan = len(scan_list)
-    num_procs = min(opts.local_threads, num_scan)
+    num_runs = len(bold_scan_list)
+    num_procs = min(opts.local_threads, num_runs)
 
     EPI_target_buffer = pe.Node(niu.IdentityInterface(fields=['EPI_template', 'EPI_mask']),
                                         name="EPI_target_buffer")
 
     commonspace_reg_wf = init_commonspace_reg_wf(opts=opts, commonspace_masking=opts.commonspace_reg['masking'], brain_extraction=opts.commonspace_reg['brain_extraction'], template_reg=opts.commonspace_reg['template_registration'], fast_commonspace=opts.commonspace_reg['fast_commonspace'], output_folder=output_folder, transforms_datasink=transforms_datasink, num_procs=num_procs, output_datasinks=True, joinsource_list=['main_split'], name='commonspace_reg_wf')
-
+    
     bold_main_wf = init_bold_main_wf(opts=opts, output_folder=output_folder, bold_scan_list=bold_scan_list)
 
     # organizing visual QC outputs
@@ -227,13 +237,13 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
 
     # MAIN WORKFLOW STRUCTURE #######################################################
     workflow.connect([
-        (main_split, bold_selectfiles, [
-            ("scan_info", "scan_info"),
+        (main_split, bold_selectfilessingle, [
+            ("scan_info", "scan_info")
             ]),
-        (bold_selectfiles, bold_convert_to_RAS_node, [
+        (bold_selectfilessingle, bold_convert_to_RAS_node, [
             ('out_file', 'img_file'),
             ]),
-        (bold_selectfiles, outputnode, [
+        (bold_selectfilessingle, outputnode, [
             ('out_file', 'input_bold'),
             ]),
         (format_bold_buffer, bold_main_wf, [
@@ -290,14 +300,14 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
             ("outputnode.corrected_EPI", "final_denoise"),
             ("outputnode.denoise_mask", "warped_mask"),
             ]),
-        (bold_selectfiles, bold_inho_cor_diagnosis,
+        (bold_selectfilessingle, bold_inho_cor_diagnosis,
          [("out_file", "name_source")]),
         (bold_main_wf, temporal_diagnosis, [
             ("outputnode.commonspace_bold", "bold_file"),
             ("outputnode.motion_params_csv", "motion_params_csv"),
             ("outputnode.FD_csv", "FD_csv"),
             ]),
-        (bold_selectfiles, temporal_diagnosis,
+        (bold_selectfilessingle, temporal_diagnosis,
          [("out_file", "name_source")]),
         (temporal_diagnosis, outputnode, [
             ("tSNR_filename", "tSNR_filename"),
@@ -310,7 +320,12 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                             name="run_split")
         run_split.itersource = ('main_split', 'split_name')
         run_split.iterables = [('run', run_iter)]
-
+        
+        echo_split = pe.Node(niu.IdentityInterface(fields=['echo', 'split_name','run']),
+                            name="echo_split")
+        echo_split.itersource = ('run_split', 'run')
+        echo_split.iterables = [('echo', echo_iter)]
+        
         anat_selectfiles = pe.Node(BIDSDataGraber(bids_dir=data_dir_path, suffix=[
                                    'T2w', 'T1w']), name='anat_selectfiles')
         anat_selectfiles.inputs.run = None
@@ -350,8 +365,13 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                 ]),
             (main_split, anat_selectfiles,
              [("scan_info", "scan_info")]),
-            (run_split, bold_selectfiles, [
+            (run_split, echo_split, [
+                ("split_name", "split_name"),
                 ("run", "run"),
+                ]),
+            (echo_split, bold_selectfilessingle, [
+                ("run", "run"),
+                ("echo","echo")
                 ]),
             (anat_selectfiles, anat_convert_to_RAS_node,
              [("out_file", "img_file")]),
@@ -451,7 +471,7 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
             preprocess_visual_QC.PlotOverlap(), name='PlotOverlap_EPI2Anat')
         PlotOverlap_EPI2Anat_node.inputs.out_dir = output_folder+'/preprocess_QC_report/EPI2Anat'
         workflow.connect([
-            (bold_selectfiles, PlotOverlap_EPI2Anat_node,
+            (bold_selectfilessingle, PlotOverlap_EPI2Anat_node,
              [("out_file", "name_source")]),
             (anat_inho_cor_wf, PlotOverlap_EPI2Anat_node,
              [("outputnode.corrected", "fixed")]),
@@ -462,7 +482,7 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
 
     # fill the datasinks
     workflow.connect([
-        (bold_selectfiles, bold_datasink, [
+        (bold_selectfilessingle, bold_datasink, [
             ("out_file", "input_bold"),
             ]),
         (outputnode, motion_datasink, [
