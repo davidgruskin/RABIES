@@ -11,9 +11,14 @@ from nipype.interfaces.utility import Function
 
 import pdb
 
+def check_echo(filename):
+    import os
+    if 'echo-1' in os.path.basename(filename):
+        return filename
+    else:
+        return None
 
-
-def init_bold_main_wf(opts, output_folder, bold_scan_list, inho_cor_only=False, name='bold_main_wf'):
+def init_bold_main_wf_subsequent_echo(opts, output_folder, bold_scan_list, inho_cor_only=False, name='bold_main_wf_subsequent_echo'):
     """
     This workflow controls the functional preprocessing stages of the pipeline when both
     functional and anatomical images are provided.
@@ -123,7 +128,7 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list, inho_cor_only=False, 
                 fields=['bold', 'inho_cor_anat', 'inho_cor_mask', 'coreg_anat', 'coreg_mask',
                         'native_to_commonspace_transform_list','native_to_commonspace_inverse_list',
                         'commonspace_to_native_transform_list','commonspace_to_native_inverse_list',
-                        'commonspace_ref','echo_num']),
+                        'commonspace_ref']),
                         name="inputnode")
 
     outputnode = pe.Node(niu.IdentityInterface(
@@ -135,7 +140,10 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list, inho_cor_only=False, 
                         'raw_brain_mask']),
                 name='outputnode')
 
-    
+    check_echo_node = pe.Node(Function(input_names=['filename'],
+                                  output_names=['valid_filename'],
+                                  function=check_echo),
+                          name='check_echo_node')
     boldbuffer = pe.Node(niu.IdentityInterface(fields=['bold_file']),
                          name="boldbuffer")
 
@@ -148,6 +156,7 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list, inho_cor_only=False, 
                                             name="template_inputnode")
 
         bold_reference_wf = init_bold_reference_wf(opts=opts)
+
         num_scan = len(bold_scan_list)
         num_procs = min(opts.local_threads, num_scan)
         inho_cor_wf = init_inho_correction_wf(opts=opts, image_type='EPI', output_folder=output_folder, num_procs=num_procs, name="bold_inho_cor_wf")
@@ -205,9 +214,9 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list, inho_cor_only=False, 
                 ])
         else:
             workflow.connect([
-                (inputnode, boldbuffer, [('bold', 'bold_file')]),
+                (inputnode, check_echo_node, [('bold', 'filename')]),
+                (check_echo_node, boldbuffer, [('valid_filename', 'bold_file')]),
                 ])
-
 
         if opts.detect_dummy:
             def remove_dummy(bold_file):
