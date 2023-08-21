@@ -149,7 +149,7 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                 'bold_to_anat_warp', 'bold_to_anat_inverse_warp', 'inho_cor_bold_warped2anat', 'native_bold', 'native_bold_ref', 'motion_params_csv',
                 'FD_voxelwise', 'pos_voxelwise', 'FD_csv', 'native_brain_mask', 'native_WM_mask', 'native_CSF_mask', 'native_vascular_mask', 'native_labels',
                 'commonspace_bold', 'commonspace_mask', 'commonspace_WM_mask', 'commonspace_CSF_mask', 'commonspace_vascular_mask',
-                'commonspace_labels', 'std_filename', 'tSNR_filename', 'raw_brain_mask','motcorr_params','te']),
+                'commonspace_labels', 'std_filename', 'tSNR_filename', 'raw_brain_mask','motcorr_params','te','bold_mot_only']),
         name='outputnode')
 
     
@@ -178,7 +178,8 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
     split_name, scan_info, run_iter,echo_iter, scan_list, bold_scan_list = prep_bids_iter(
         layout, opts.bold_only)
     
-    num_echoes = len(set([echo[0] for echo in echo_iter.values()]))
+    #num_echoes = len(set([echo[0] for echo in echo_iter.values()]))
+    num_echoes = max(int(i) for sublist in echo_iter.values() for i in sublist)
 
     # setting up all iterables
     main_split = pe.Node(niu.IdentityInterface(fields=['split_name', 'scan_info']),
@@ -243,11 +244,6 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                             name="run_split")
         run_split.itersource = ('main_split', 'split_name')
         run_split.iterables = [('run', run_iter)]
-
-        echo_split_first = pe.Node(niu.IdentityInterface(fields=['echo', 'split_name','run']),
-                                name="echo_split_first")
-        echo_split_first.itersource = ('run_split', 'run')
-        echo_split_first.iterables = [('echo', {key: value[0] for key, value in echo_iter.items()})]
 
         anat_selectfiles = pe.Node(BIDSDataGraber(bids_dir=data_dir_path, suffix=[
                                    'T2w', 'T1w']), name='anat_selectfiles')
@@ -372,8 +368,6 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                 ]),
             ])
 
-
-
     # fill the datasinks
     if not opts.bold_only:
         workflow.connect([
@@ -390,11 +384,11 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                                     output_names=['te'],
                                     function=extract_te_from_json),
                             name='extract_te_node')
-    num_echoes = 3
+
     merge_commonspace = pe.Node(Merge(num_echoes), name='merge_commonspace')
     merge_te = pe.Node(Merge(num_echoes), name='merge_te')
 
-    for echo_num in range(1, num_echoes + 1):  # Start from 2 because the first echo is already processed
+    for echo_num in range(1, num_echoes + 1):  
 
         # Clone the BOLD processing workflow for the current echo
         echo_num_node = pe.Node(IdentityInterface(fields=["echo_num"]), name=f"echo_num_{echo_num}")
@@ -472,6 +466,7 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                 ]),
             (current_bold_wf, current_bold_outputnode, [
                 ("outputnode.bold_ref", "initial_bold_ref"),
+                ("outputnode.bold_mot_only", "bold_mot_only"),
                 ("outputnode.corrected_EPI", "inho_cor_bold"),
                 ("outputnode.native_brain_mask", "native_brain_mask"),
                 ("outputnode.native_WM_mask", "native_WM_mask"),
@@ -511,7 +506,7 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                 ("tSNR_filename", "tSNR_filename"),
                 ("std_filename", "std_filename"),
             ]),
-            (current_bold_outputnode, merge_commonspace, [('commonspace_bold', f'in{echo_num}')]),
+            (current_bold_outputnode, merge_commonspace, [('bold_mot_only', f'in{echo_num}')]),
             (current_bold_outputnode, merge_te, [('te', f'in{echo_num}')])
         ])
         if echo_num == 1:
@@ -535,16 +530,10 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                 (first_bold_wf_outputnode,current_bold_wf,
                     [("motcorr_params", "inputnode.motcorr_params")
                     ]), 
-                (first_bold_wf_outputnode, current_bold_wf, [
-                    ('bold_to_anat_affine', 'inputnode.bold_to_anat_affine'),
-                    ('bold_to_anat_warp', 'inputnode.bold_to_anat_warp'),
-                    ('bold_to_anat_inverse_warp', 'inputnode.bold_to_anat_inverse_warp'),
-                    ]),
                 (first_bold_wf_outputnode,current_bold_wf,
                     [("initial_bold_ref", "inputnode.bold_ref")
                     ]),         
             ])
-
 
         ## Now add common BOLD connections
         workflow.connect([
@@ -556,6 +545,7 @@ def init_main_wf(data_dir_path, output_folder, opts, name='main_wf'):
                 ("native_CSF_mask", "native_CSF_mask"),  # get the EPI labels
                 ("native_vascular_mask", "native_vascular_mask"),  # get the EPI labels
                 ("native_labels", "native_labels"),  # get the EPI labels
+                ("bold_mot_only", "bold_mot_only"),  # get the EPI labels
                 # warped EPI to anat
                 ("inho_cor_bold_warped2anat", "inho_cor_bold_warped2anat"),
                 # resampled EPI after motion realignment and SDC
