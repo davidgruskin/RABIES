@@ -129,7 +129,7 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
                         'native_bold', 'native_bold_ref', 'native_brain_mask', 'native_WM_mask', 'native_CSF_mask', 'native_vascular_mask', 'native_labels',
                         'motion_params_csv', 'FD_voxelwise', 'pos_voxelwise', 'FD_csv', 'commonspace_bold', 'commonspace_mask',
                         'commonspace_WM_mask', 'commonspace_CSF_mask', 'commonspace_vascular_mask', 'commonspace_labels',
-                        'raw_brain_mask','bold_mot_only']),
+                        'raw_brain_mask','bold_mot_only','bold_commonspace_trans_only','bold_native_trans_only','raw_to_native_transform_list','raw_to_native_inverse_list','commonspace_to_raw_transform_list','commonspace_to_raw_inverse_list','to_commonspace_transform_list','to_commonspace_inverse_list','commonspace_to_native_transform_list','commonspace_to_native_inverse_list']),
                 name='outputnode')
 
     
@@ -144,7 +144,7 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
         template_inputnode = pe.Node(niu.IdentityInterface(fields=['template_anat', 'template_mask']),
                                             name="template_inputnode")
 
-        if echo_num == 1:
+        if echo_num == 1 or echo_num == 9:
             bold_reference_wf = init_bold_reference_wf(opts=opts)
         num_scan = len(bold_scan_list)
         num_procs = min(opts.local_threads, num_scan)
@@ -187,7 +187,7 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
                     ]),
                 ])
         else:
-            if echo_num == 1:
+            if echo_num == 1 or echo_num == 9:
                 workflow.connect([
                     (boldbuffer, bold_reference_wf, [
                         ('bold_file', 'inputnode.bold_file'),
@@ -272,7 +272,7 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
                 ('outputnode.corrected', 'corrected_EPI'),
                 ]),
             ])
-        if echo_num == 1:
+        if echo_num == 1 or echo_num == 9:
             workflow.connect([
                 (bold_reference_wf, inho_cor_wf, [
                     ('outputnode.ref_image', 'inputnode.target_img'),
@@ -294,10 +294,10 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
     if inho_cor_only:
         return workflow
 
-    bold_stc_wf = init_bold_stc_wf(opts=opts)
+    bold_stc_wf = init_bold_stc_wf(opts=opts,echo_num=echo_num)
 
     # HMC on the BOLD
-    if echo_num == 1:
+    if echo_num == 1 or echo_num == 9:
         bold_hmc_wf = init_bold_hmc_wf(opts=opts)
 
     estimate_motion_node = pe.Node(EstimateMotionParams(),
@@ -358,14 +358,18 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
                 ('commonspace_to_raw_transform_list', 'inputnode.commonspace_to_raw_transform_list'),
                 ('commonspace_to_raw_inverse_list', 'inputnode.commonspace_to_raw_inverse_list'),
                 ]),
+            (prep_resampling_transforms_node, outputnode, [
+                ('raw_to_native_transform_list', 'raw_to_native_transform_list'),
+                ('raw_to_native_inverse_list', 'raw_to_native_inverse_list'),
+                ('commonspace_to_raw_transform_list', 'commonspace_to_raw_transform_list'),
+                ('commonspace_to_raw_inverse_list', 'commonspace_to_raw_inverse_list'),
+                ]),
             (transitionnode, bold_native_trans_wf, [
                 ('bold_ref', 'inputnode.raw_bold_ref'),
-                ]),
-            (transitionnode, bold_commonspace_trans_wf, [ # CHECK HERE
-                    ('bold_ref', 'inputnode.med_EPI'),
-                ]),   
+                ]),  
             (bold_native_trans_wf, outputnode, [
                 ('outputnode.bold', 'native_bold'),
+                ('outputnode.bold_trans_only', 'bold_native_trans_only'),
                 ('outputnode.bold_ref','native_bold_ref'),
                 ('outputnode.brain_mask', 'native_brain_mask'),
                 ('outputnode.WM_mask', 'native_WM_mask'),
@@ -378,7 +382,7 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
             (cross_modal_reg_wf, outputnode, [
                 ('outputnode.output_warped_bold', 'output_warped_bold')]),
             ])
-        if echo_num == 1:
+        if echo_num == 1 or echo_num == 9:
             workflow.connect([
                 (bold_hmc_wf, bold_native_trans_wf, [
                 ('outputnode.motcorr_params', 'inputnode.motcorr_params')]),
@@ -457,6 +461,10 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
             ('commonspace_to_raw_transform_list', 'inputnode.commonspace_to_raw_transform_list'),
             ('commonspace_to_raw_inverse_list', 'inputnode.commonspace_to_raw_inverse_list'),
             ]),
+        (prep_resampling_transforms_node, outputnode, [
+            ('to_commonspace_transform_list', 'to_commonspace_transform_list'),
+            ('to_commonspace_inverse_list', 'to_commonspace_inverse_list'),
+            ]),
         (transitionnode, bold_commonspace_trans_wf, [
             ('bold_ref', 'inputnode.raw_bold_ref'),
             ]),
@@ -470,6 +478,7 @@ def init_bold_main_wf(opts, output_folder, bold_scan_list,echo_num, inho_cor_onl
         (bold_commonspace_trans_wf, outputnode, [
             ('outputnode.bold', 'commonspace_bold'),
             ('outputnode.bold_mot_only', 'bold_mot_only'),
+            ('outputnode.bold_trans_only', 'bold_commonspace_trans_only'),
             ('outputnode.brain_mask', 'commonspace_mask'),
             ('outputnode.WM_mask', 'commonspace_WM_mask'),
             ('outputnode.CSF_mask', 'commonspace_CSF_mask'),
