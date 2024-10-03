@@ -14,7 +14,7 @@ def init_diagnosis_wf(analysis_opts, commonspace_bold, preprocess_opts, split_na
         fields=['dict_file', 'analysis_dict']), name='inputnode')
     outputnode = pe.Node(niu.IdentityInterface(fields=['figure_temporal_diagnosis', 'figure_spatial_diagnosis', 
                                                        'analysis_QC', 'temporal_info_csv', 'spatial_VE_nii', 'temporal_std_nii', 'GS_corr_nii', 'GS_cov_nii',
-                                                       'CR_prediction_std_nii', 'random_CR_std_nii', 'corrected_CR_std_nii']), name='outputnode')
+                                                       'CR_prediction_std_nii']), name='outputnode')
 
     if os.path.basename(preprocess_opts.anat_template)=='DSURQE_40micron_average.nii.gz':
         DSURQE_regions=True
@@ -23,9 +23,9 @@ def init_diagnosis_wf(analysis_opts, commonspace_bold, preprocess_opts, split_na
 
     ScanDiagnosis_node = pe.Node(ScanDiagnosis(prior_bold_idx=analysis_opts.prior_bold_idx,
         prior_confound_idx=analysis_opts.prior_confound_idx,
-            NPR_temporal_comp=analysis_opts.NPR_temporal_comp, 
-            NPR_spatial_comp=analysis_opts.NPR_spatial_comp, 
-            DSURQE_regions=DSURQE_regions),
+            DSURQE_regions=DSURQE_regions,
+            figure_format=analysis_opts.figure_format, 
+            ),
         name='ScanDiagnosis')
 
     temporal_external_formating_node = pe.Node(Function(input_names=['temporal_info', 'dict_file'],
@@ -36,7 +36,7 @@ def init_diagnosis_wf(analysis_opts, commonspace_bold, preprocess_opts, split_na
 
     spatial_external_formating_node = pe.Node(Function(input_names=['spatial_info', 'dict_file'],
                                             output_names=[
-                                                'VE_filename', 'std_filename', 'predicted_std_filename', 'random_CR_std_filename', 'corrected_CR_std_filename', 
+                                                'VE_filename', 'std_filename', 'predicted_std_filename', 
                                                 'GS_corr_filename', 'GS_cov_filename'],
                                         function=spatial_external_formating),
                                 name='spatial_external_formating')
@@ -65,8 +65,6 @@ def init_diagnosis_wf(analysis_opts, commonspace_bold, preprocess_opts, split_na
             ("VE_filename", "spatial_VE_nii"),
             ("std_filename", "temporal_std_nii"),
             ("predicted_std_filename", "CR_prediction_std_nii"),
-            ("random_CR_std_filename", "random_CR_std_nii"),
-            ("corrected_CR_std_filename", "corrected_CR_std_nii"),
             ("GS_corr_filename", "GS_corr_nii"),
             ("GS_cov_filename", "GS_cov_nii"),
             ]),
@@ -74,14 +72,14 @@ def init_diagnosis_wf(analysis_opts, commonspace_bold, preprocess_opts, split_na
 
     if (commonspace_bold or preprocess_opts.bold_only) and not len(split_name_list)<3:
 
-        def prep_scan_data(dict_file, analysis_dict, spatial_info, temporal_info):
+        def prep_scan_data(dict_file, spatial_info, temporal_info):
             import pickle
             with open(dict_file, 'rb') as handle:
                 data_dict = pickle.load(handle)
 
             scan_data={}
 
-            dict_keys = ['temporal_std', 'VE_spatial', 'predicted_std', 'corrected_CR_std', 'random_CR_std', 'GS_corr', 'GS_cov',
+            dict_keys = ['temporal_std', 'VE_spatial', 'predicted_std', 'GS_corr', 'GS_cov',
                             'DR_BOLD', 'NPR_maps', 'prior_maps', 'seed_map_list']
             for key in dict_keys:
                 scan_data[key] = spatial_info[key]
@@ -103,7 +101,7 @@ def init_diagnosis_wf(analysis_opts, commonspace_bold, preprocess_opts, split_na
             scan_data['mask_file'] = data_dict['mask_file']
             return scan_data
 
-        prep_scan_data_node = pe.Node(Function(input_names=['dict_file', 'analysis_dict', 'spatial_info', 'temporal_info'],
+        prep_scan_data_node = pe.Node(Function(input_names=['dict_file', 'spatial_info', 'temporal_info'],
                                             output_names=['scan_data'],
                                         function=prep_scan_data),
                                 name='prep_scan_data_node')
@@ -124,11 +122,14 @@ def init_diagnosis_wf(analysis_opts, commonspace_bold, preprocess_opts, split_na
         DatasetDiagnosis_node.inputs.seed_prior_maps = analysis_opts.seed_prior_list
         DatasetDiagnosis_node.inputs.outlier_threshold = analysis_opts.outlier_threshold
         DatasetDiagnosis_node.inputs.network_weighting = analysis_opts.network_weighting
+        DatasetDiagnosis_node.inputs.scan_QC_thresholds = analysis_opts.scan_QC_thresholds
+        DatasetDiagnosis_node.inputs.figure_format = analysis_opts.figure_format
+        DatasetDiagnosis_node.inputs.extended_QC = analysis_opts.extended_QC
+        DatasetDiagnosis_node.inputs.group_avg_prior = analysis_opts.group_avg_prior
 
         workflow.connect([
             (inputnode, prep_scan_data_node, [
                 ("dict_file", "dict_file"),
-                ("analysis_dict", "analysis_dict"),
                 ]),
             (ScanDiagnosis_node, prep_scan_data_node, [
                 ("spatial_info", "spatial_info"),

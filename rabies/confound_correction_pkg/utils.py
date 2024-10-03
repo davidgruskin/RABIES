@@ -107,18 +107,18 @@ def gen_FD_mask(FD_trace, scrubbing_threshold):
     return mask
 
 
-def prep_CR(bold_file, confounds_file, FD_file, cr_opts):
+def prep_CR(bold_file, motion_params_csv, FD_file, cr_opts):
     import pandas as pd
     import SimpleITK as sitk
-    from rabies.confound_correction_pkg.utils import select_confound_timecourses
+    from rabies.confound_correction_pkg.utils import select_motion_regressors
 
     # save specifically the 6 rigid parameters for AROMA
-    confounds_6rigid_array = select_confound_timecourses(['mot_6'],confounds_file,FD_file)
+    confounds_6rigid_array = select_motion_regressors(['mot_6'],motion_params_csv)
 
     if len(cr_opts.conf_list)==0:
         confounds_array = confounds_6rigid_array
     else:
-        confounds_array = select_confound_timecourses(cr_opts.conf_list,confounds_file,FD_file)
+        confounds_array = select_motion_regressors(cr_opts.conf_list,motion_params_csv)
 
     FD_trace = pd.read_csv(FD_file).get('Mean')
 
@@ -133,7 +133,7 @@ def prep_CR(bold_file, confounds_file, FD_file, cr_opts):
     else:
         time_range = range(sitk.ReadImage(bold_file).GetSize()[3])
 
-    data_dict = {'FD_trace':FD_trace, 'confounds_array':confounds_array, 'confounds_6rigid_array':confounds_6rigid_array, 'confounds_csv':confounds_file, 'time_range':time_range}
+    data_dict = {'FD_trace':FD_trace, 'confounds_array':confounds_array, 'confounds_6rigid_array':confounds_6rigid_array, 'motion_params_csv':motion_params_csv, 'time_range':time_range}
     return data_dict
 
 def temporal_censoring(timeseries, FD_trace, 
@@ -171,34 +171,79 @@ def temporal_censoring(timeseries, FD_trace,
     return frame_mask,FD_trace,DVARS
 
 
-def select_confound_timecourses(conf_list,confounds_file,FD_file):
+def select_motion_regressors(conf_list,motion_params_csv):
     import pandas as pd
     if ('mot_6' in conf_list) and ('mot_24' in conf_list):
         raise ValueError(
             "Can't select both the mot_6 and mot_24 options; must pick one.")
 
-    confounds = pd.read_csv(confounds_file)
+    confounds = pd.read_csv(motion_params_csv)
     keys = confounds.keys()
     conf_keys = []
+    # only inputing motion regressors at this stage
     for conf in conf_list:
         if conf == 'mot_6':
             conf_keys += ['mov1', 'mov2', 'mov3', 'rot1', 'rot2', 'rot3']
         elif conf == 'mot_24':
             conf_keys += [s for s in keys if "rot" in s or "mov" in s]
-        elif conf == 'aCompCor':
-            aCompCor_keys = [s for s in keys if "aCompCor" in s]
-            from nipype import logging
-            log = logging.getLogger('nipype.workflow')
-            log.info('Applying aCompCor with '+str(len(aCompCor_keys))+' components.')
-            conf_keys += aCompCor_keys
-        elif conf == 'mean_FD':
-            mean_FD = pd.read_csv(FD_file).get('Mean')
-            confounds['mean_FD'] = mean_FD
-            conf_keys += [conf]
-        else:
-            conf_keys += [conf]
 
     return np.asarray(confounds[conf_keys])
+
+
+def compute_signal_regressors(timeseries,volume_indices, conf_list,brain_mask_file,WM_mask_file,CSF_mask_file,vascular_mask_file):
+
+    # make sure there are no NaN voxels
+    timeseries[np.isnan(timeseries)] = 0
+
+    regressors_array = np.empty([timeseries.shape[0],0])
+    for conf,mask_file in zip(['WM_signal','CSF_signal','vascular_signal','global_signal'],
+                                [WM_mask_file,CSF_mask_file,vascular_mask_file,brain_mask_file]):
+        if conf in conf_list:
+            mask_idx = sitk.GetArrayFromImage(sitk.ReadImage(mask_file, sitk.sitkFloat32)).astype(bool)
+            regressor_trace = timeseries.T[mask_idx[volume_indices]].mean(axis=0)
+            regressors_array = np.append(regressors_array,regressor_trace.reshape(-1,1),axis=1)
+    
+    if ('aCompCor_5' in conf_list) or ('aCompCor_percent' in conf_list):
+        if ('aCompCor_5' in conf_list) and ('aCompCor_percent' in conf_list):
+            raise ValueError(
+                "Can't select both the aCompCor_5 and aCompCor_percent options; must pick one.")
+        if 'aCompCor_5' in conf_list:
+            method='aCompCor_5'
+        elif 'aCompCor_percent' in conf_list:
+            method='aCompCor_percent'
+        else:
+            raise
+
+        from sklearn.decomposition import PCA
+        WM_mask_idx = sitk.GetArrayFromImage(sitk.ReadImage(WM_mask_file, sitk.sitkFloat32))
+        CSF_mask_idx = sitk.GetArrayFromImage(sitk.ReadImage(CSF_mask_file, sitk.sitkFloat32))
+        combined_mask_idx = (WM_mask_idx+CSF_mask_idx) > 0
+
+        masked_timeseries = timeseries[:,combined_mask_idx[volume_indices]]
+
+        if method == 'aCompCor_percent':
+            pca = PCA()
+            pca.fit(masked_timeseries)
+            explained_variance = pca.explained_variance_ratio_
+            cum_var = 0
+            num_comp = 0
+            # evaluate the # of components to explain 50% of the variance
+            while(cum_var <= 0.5):
+                cum_var += explained_variance[num_comp]
+                num_comp += 1
+            from nipype import logging
+            log = logging.getLogger('nipype.workflow')
+            log.info("Extracting "+str(num_comp)+" components for aCompCorr.")
+
+        elif method == 'aCompCor_5':
+            num_comp = 5
+
+        pca = PCA(n_components=num_comp)
+        comp_timeseries = pca.fit_transform(masked_timeseries)
+        regressors_array = np.append(regressors_array,comp_timeseries,axis=1)
+
+    return regressors_array
+
 
 
 def remove_trend(timeseries, frame_mask, second_order=False, keep_intercept=False):
@@ -402,7 +447,7 @@ def phase_randomized_regressors(confounds_array, frame_mask, TR):
     return randomized_confounds_array
 
 
-def smooth_image(img, affine, fwhm):
+def smooth_image(img, affine, fwhm, mask_img):
     # apply nilearn's Gaussian smoothing on a SITK image
     from nilearn.image.image import _smooth_array
     from rabies.utils import copyInfo_4DImage, copyInfo_3DImage
@@ -421,12 +466,28 @@ def smooth_image(img, affine, fwhm):
         array_3d = sitk.GetArrayFromImage(img)
         arr = array_3d.transpose(2,1,0) # re-orient the array to match the affine
     smoothed_arr = _smooth_array(arr, affine, fwhm=fwhm, ensure_finite=True, copy=True)
+    
+    # smoothing creates leakage around mask boundaries
+    # correct for edge effects by dividing by the smoothed mask like FSL https://johnmuschelli.com/fslr/reference/fslsmooth.html
+    mask_arr = sitk.GetArrayFromImage(mask_img).transpose(2,1,0) # re-orient the array to match the affine
+    smoothed_mask = _smooth_array(mask_arr, affine, fwhm=fwhm, ensure_finite=True, copy=True)
+    smoothed_mask = smoothed_mask.transpose(2,1,0) # recover SITK orientation
+
+    # recover SITK img
     if dim==4:
         smoothed_arr = smoothed_arr.transpose(3,2,1,0)
+        smoothed_arr /= smoothed_mask # correct for edge effect
+        smoothed_arr *= sitk.GetArrayFromImage(mask_img) # re-apply mask
+        smoothed_arr[np.isnan(smoothed_arr)] = 0
+        
         smoothed_img = copyInfo_4DImage(sitk.GetImageFromArray(
             smoothed_arr, isVector=False), img, img)
     elif dim==3:
         smoothed_arr = smoothed_arr.transpose(2,1,0)
+        smoothed_arr /= smoothed_mask # correct for edge effect
+        smoothed_arr *= sitk.GetArrayFromImage(mask_img) # re-apply mask
+        smoothed_arr[np.isnan(smoothed_arr)] = 0
+        
         smoothed_img = copyInfo_3DImage(sitk.GetImageFromArray(
             smoothed_arr, isVector=False), img)
 

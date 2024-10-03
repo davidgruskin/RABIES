@@ -29,7 +29,7 @@ def resample_mask(in_file, ref_file):
             transform_string += f"-t {transform} "
 
     command = f'antsApplyTransforms -i {in_file} {transform_string}-n GenericLabel -r {ref_file} -o {out_file}'
-    rc = run_command(command)
+    rc,c_out = run_command(command)
     return out_file
 
 
@@ -38,7 +38,7 @@ Prepare the subject data
 '''
 
 
-def process_data(data_dict, analysis_dict, prior_bold_idx, prior_confound_idx, NPR_temporal_comp=-1, NPR_spatial_comp=-1):
+def process_data(data_dict, analysis_dict, prior_bold_idx, prior_confound_idx):
     temporal_info = {}
     spatial_info = {}
     temporal_info['name_source'] = data_dict['name_source']
@@ -76,10 +76,12 @@ def process_data(data_dict, analysis_dict, prior_bold_idx, prior_confound_idx, N
         spatial_info['seed_map_list'] = []
         temporal_info['SBC_time'] = []
 
-    ### SBC analysis
+    ### DR analysis
     DR_W = np.array(pd.read_csv(analysis_dict['dual_regression_timecourse_csv'], header=None))
     DR_array = sitk.GetArrayFromImage(
         sitk.ReadImage(analysis_dict['dual_regression_nii']))
+    if len(DR_array.shape)==3: # if there was only one component, need to convert to 4D array
+        DR_array = DR_array[np.newaxis,:,:,:]
     DR_C = np.zeros([DR_array.shape[0], volume_indices.sum()])
     for i in range(DR_array.shape[0]):
         DR_C[i, :] = (DR_array[i, :, :, :])[volume_indices]
@@ -106,10 +108,13 @@ def process_data(data_dict, analysis_dict, prior_bold_idx, prior_confound_idx, N
     GS_corr = analysis_functions.vcorrcoef(timeseries.T, global_signal)
 
     prior_fit_out = {'C': [], 'W': []}
-    if (NPR_temporal_comp>-1) or (NPR_spatial_comp>-1):
+    if not analysis_dict['NPR_prior_filename'] is None:
         prior_fit_out['W'] = np.array(pd.read_csv(analysis_dict['NPR_prior_timecourse_csv'], header=None))
         C_array = sitk.GetArrayFromImage(
             sitk.ReadImage(analysis_dict['NPR_prior_filename']))
+        if len(C_array.shape)==3: # if there was only one component, need to convert to 4D array
+            C_array = C_array[np.newaxis,:,:,:]
+
         C = np.zeros([C_array.shape[0], volume_indices.sum()])
         for i in range(C_array.shape[0]):
             C[i, :] = (C_array[i, :, :, :])[volume_indices]
@@ -125,8 +130,6 @@ def process_data(data_dict, analysis_dict, prior_bold_idx, prior_confound_idx, N
     spatial_info['VE_spatial'] = data_dict['VE_spatial']
     spatial_info['temporal_std'] = data_dict['temporal_std']
     spatial_info['predicted_std'] = data_dict['predicted_std']
-    spatial_info['random_CR_std'] = data_dict['random_CR_std']
-    spatial_info['corrected_CR_std'] = data_dict['corrected_CR_std']
     spatial_info['GS_corr'] = GS_corr
     spatial_info['GS_cov'] = GS_cov
 
@@ -170,14 +173,6 @@ def spatial_external_formating(spatial_info):
     sitk.WriteImage(recover_3D(
         mask_file, spatial_info['predicted_std']), predicted_std_filename)
 
-    random_CR_std_filename = os.path.abspath(filename_split[0]+'_random_CR_std.nii.gz')
-    sitk.WriteImage(recover_3D(
-        mask_file, spatial_info['random_CR_std']), random_CR_std_filename)
-
-    corrected_CR_std_filename = os.path.abspath(filename_split[0]+'_corrected_CR_std.nii.gz')
-    sitk.WriteImage(recover_3D(
-        mask_file, spatial_info['corrected_CR_std']), corrected_CR_std_filename)
-
     GS_corr_filename = os.path.abspath(filename_split[0]+'_GS_corr.nii.gz')
     sitk.WriteImage(recover_3D(
         mask_file, spatial_info['GS_corr']), GS_corr_filename)
@@ -186,7 +181,7 @@ def spatial_external_formating(spatial_info):
     sitk.WriteImage(recover_3D(
         mask_file, spatial_info['GS_cov']), GS_cov_filename)
 
-    return VE_filename, std_filename, predicted_std_filename, random_CR_std_filename, corrected_CR_std_filename, GS_corr_filename, GS_cov_filename
+    return VE_filename, std_filename, predicted_std_filename, GS_corr_filename, GS_cov_filename
 
 
 '''
@@ -236,20 +231,46 @@ def grayplot(timeseries, ax):
     return im
 
 
+def plot_freqs(ax,timeseries, TR):
+    freqs = np.fft.fftfreq(timeseries.shape[0], TR)
+    idx = np.argsort(freqs)
+    pos_idx = idx[freqs[idx]>0]
+
+    ps = np.abs(np.fft.fft(timeseries.T))**2
+    ps_mean = ps.mean(axis=0)
+    ps_std = ps.std(axis=0)
+
+    y_max = ps_mean[freqs>0.01].max()*1.5
+
+    ax.plot(freqs[pos_idx], ps_mean[pos_idx])
+    ax.fill_between(freqs[pos_idx], (ps_mean-ps_std)[pos_idx],(ps_mean+ps_std)[pos_idx], alpha=0.4)
+    ax.set_ylim([0,y_max])
+    ax.set_xlim([0,freqs.max()])
+    xticks = np.arange(0,freqs.max(),0.05)
+    ax.set_xticks(xticks)    
+
+
 def scan_diagnosis(data_dict, temporal_info, spatial_info, regional_grayplot=False):
     timeseries = data_dict['timeseries']
     template_file = data_dict['template_file']
     CR_data_dict = data_dict['CR_data_dict']
     
-    fig = plt.figure(figsize=(6, 18))
-    #fig.suptitle(name, fontsize=30, color='white')
-    
-    ax0 = fig.add_subplot(3,1,1)
-    ax1 = fig.add_subplot(12,1,5)
-    ax1_ = fig.add_subplot(12,1,6)
-    ax2 = fig.add_subplot(6,1,4)
-    ax3 = fig.add_subplot(6,1,5)
-    ax4 = fig.add_subplot(6,1,6)
+    fig = plt.figure(figsize=(12, 24))
+
+    ax0 = fig.add_subplot(4,2,3)
+    ax0_f = fig.add_subplot(9,2,3) # plot frequencies
+
+    ax1 = fig.add_subplot(16,2,17)
+    ax1_ = fig.add_subplot(16,2,19)
+    ax2 = fig.add_subplot(8,2,11)
+    ax3 = fig.add_subplot(8,2,13)
+    ax4 = fig.add_subplot(8,2,15)
+
+    plot_freqs(ax0_f,timeseries, CR_data_dict['TR'])
+    plt.setp(ax0_f.get_yticklabels(), visible=False)
+    plt.setp(ax0_f.get_xticklabels(), fontsize=12)
+    ax0_f.set_xlabel('Frequency (Hz)', fontsize=20)
+    ax0_f.set_ylabel('Power (a.u.)', fontsize=20)
 
     # disable function
     regional_grayplot=False
@@ -293,16 +314,17 @@ def scan_diagnosis(data_dict, temporal_info, spatial_info, regional_grayplot=Fal
     ax4.set_xlim([0, len(y)-1])
 
     # plot the motion timecourses
-    confounds_csv = CR_data_dict['confounds_csv']
+    motion_params_csv = CR_data_dict['motion_params_csv']
     time_range = CR_data_dict['time_range']
     frame_mask = CR_data_dict['frame_mask']
-    df = pd.read_csv(confounds_csv)
+    df = pd.read_csv(motion_params_csv)
     # take proper subset of timepoints
     ax1.plot(x,df['mov1'].to_numpy()[time_range][frame_mask])
     ax1.plot(x,df['mov2'].to_numpy()[time_range][frame_mask])
     ax1.plot(x,df['mov3'].to_numpy()[time_range][frame_mask])
     ax1.legend(['translation 1', 'translation 2', 'translation 3'],
                loc='center left', fontsize=15, bbox_to_anchor=(1.15, 0.5))
+    ax1.set_ylabel('mm', fontsize=20)
     ax1.spines['right'].set_visible(False)
     ax1.spines['top'].set_visible(False)
     plt.setp(ax1.get_xticklabels(), visible=False)
@@ -310,15 +332,16 @@ def scan_diagnosis(data_dict, temporal_info, spatial_info, regional_grayplot=Fal
     ax1_.plot(x,df['rot1'].to_numpy()[time_range][frame_mask])
     ax1_.plot(x,df['rot2'].to_numpy()[time_range][frame_mask])
     ax1_.plot(x,df['rot3'].to_numpy()[time_range][frame_mask])
-    ax1_.legend(['rotation 1', 'rotation 2', 'rotation 3'],
+    ax1_.legend(['Euler angle 1', 'Euler angle 2', 'Euler angle 3'],
                 loc='center left', fontsize=15, bbox_to_anchor=(1.15, 0.5))
+    ax1_.set_ylabel('radians', fontsize=20)
     plt.setp(ax1_.get_xticklabels(), visible=False)
     ax1_.spines['right'].set_visible(False)
     ax1_.spines['top'].set_visible(False)
 
     y = temporal_info['FD_trace'].to_numpy()
     ax2.plot(x,y, 'r')
-    ax2.set_ylabel('FD in mm', fontsize=20)
+    ax2.set_ylabel('FD (mm)', fontsize=20)
     DVARS = temporal_info['DVARS']
     DVARS[0] = None
     ax2_ = ax2.twinx()
@@ -339,7 +362,7 @@ def scan_diagnosis(data_dict, temporal_info, spatial_info, regional_grayplot=Fal
     ax3.plot(x,temporal_info['WM_trace'])
     ax3.plot(x,temporal_info['CSF_trace'])
     ax3.plot(x,temporal_info['predicted_time'])
-    ax3.set_ylabel('Mask L2-norm', fontsize=20)
+    ax3.set_ylabel('Amplitude \n(L2-norm)', fontsize=20)
     ax3_ = ax3.twinx()
     ax3_.plot(x,temporal_info['VE_temporal'], 'darkviolet')
     ax3_.set_ylabel('CR $\mathregular{R^2}$', fontsize=20)
@@ -347,7 +370,7 @@ def scan_diagnosis(data_dict, temporal_info, spatial_info, regional_grayplot=Fal
     ax3_.spines['top'].set_visible(False)
     plt.setp(ax3.get_xticklabels(), visible=False)
     plt.setp(ax3_.get_xticklabels(), visible=False)
-    ax3.legend(['Edge Mask', 'WM Mask', 'CSF Mask', 'CR prediction'
+    ax3.legend(['Edge Mask', 'WM Mask', 'CSF Mask', '$CR_{var}$'
                 ], loc='center left', fontsize=15, bbox_to_anchor=(1.15, 0.7))
     ax3_.legend(['CR $\mathregular{R^2}$'
                 ], loc='center left', fontsize=15, bbox_to_anchor=(1.15, 0.2))
@@ -357,30 +380,29 @@ def scan_diagnosis(data_dict, temporal_info, spatial_info, regional_grayplot=Fal
     import matplotlib.cm as cm
     Greens_colors = cm.Greens(np.linspace(0.5, 0.8, 2))
     Blues_colors = cm.Blues(np.linspace(0.5, 0.8, 2))
+    Purples_colors = cm.Purples(np.linspace(0.5, 0.8, 3))
     YlOrRd_colors = cm.YlOrRd(np.linspace(0.3, 0.8, 4))
     legend=[]
-    scaler = 0
-    for network_time,name,color in zip(
+    for network_time,name,color,scaler in zip(
             [temporal_info['DR_confound'], temporal_info['DR_bold'],temporal_info['SBC_time'],temporal_info['NPR_time']],
             ['DR confounds', 'DR networks','SBC networks','NPR networks'],
-            [YlOrRd_colors[2], Blues_colors[1],Blues_colors[0],Greens_colors[1]]):
+            [YlOrRd_colors[2], Blues_colors[1],Purples_colors[1],Greens_colors[1]],
+            [0,-1,-1,-1]):
         if len(network_time)>0:
             # make sure the timecourses are normalized
             network_time = network_time.copy()
-            #network_time /= np.sqrt((network_time ** 2).sum(axis=0))
-            network_time /= network_time.std(axis=0)
+            network_time /= np.sqrt((network_time ** 2).mean(axis=0))
             network_time_avg = np.abs(network_time).mean(axis=1)
-            # we introduce a scaler to prevent overlap of timecourses
+            # we introduce a scaler to prevent overlap of confound with network timecourses
             network_time_avg += scaler
-            scaler -= 2
-            ax4.plot(x,network_time_avg, color=color, alpha=0.8)
+            ax4.plot(x,network_time_avg, color=color, alpha=0.6)
             legend.append(name)
 
     ax4.legend(legend, loc='center left', fontsize=15, bbox_to_anchor=(1.15, 0.5))
     ax4.spines['right'].set_visible(False)
     ax4.spines['top'].set_visible(False)
     ax4.set_xlabel('Timepoint', fontsize=25)
-    ax4.set_ylabel('Mean amplitude', fontsize=20)
+    ax4.set_ylabel('Mean amplitude \n(a.u.)', fontsize=20)
     ax4.yaxis.set_ticklabels([])
     plt.setp(ax4.get_xticklabels(), fontsize=15)
 

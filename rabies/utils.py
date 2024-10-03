@@ -51,7 +51,9 @@ def resample_image_spacing(image, output_spacing):
 
     # set default threader to platform to avoid freezing with MultiProc https://github.com/SimpleITK/SimpleITK/issues/1239
     sitk.ProcessObject_SetGlobalDefaultThreader('Platform')
-    resampled_image = sitk.Resample(image, output_size, identity, sitk.sitkLinear,
+    # the resampling is done with BSpline, the interpolator order is 3
+    # other BSpline options are blurry, see https://discourse.itk.org/t/resample-produces-blurry-results-when-just-cropping/4473
+    resampled_image = sitk.Resample(image, output_size, identity, sitk.sitkBSpline,
                                     image.GetOrigin(), output_spacing, image.GetDirection())
     # clip potential negative values
     array = sitk.GetArrayFromImage(resampled_image)
@@ -59,6 +61,44 @@ def resample_image_spacing(image, output_spacing):
     pos_resampled_image = sitk.GetImageFromArray(array, isVector=False)
     pos_resampled_image.CopyInformation(resampled_image)
     return pos_resampled_image
+
+
+def resample_image_spacing_4d(image_4d, output_spacing, clip_negative=True): 
+    # output_spacing should be specifying the resolution of the 3 spatial dimensions in mm
+    if not image_4d.GetDimension()==4:
+        raise ValueError("The image must be 4 dimensional.")
+    
+    # Compute grid size based on the physical size and spacing.
+    input_size = image_4d.GetSize()
+    sampling_ratio = np.asarray(image_4d.GetSpacing())[:3]/np.asarray(output_spacing)
+    output_size = [int(input_size[0]*sampling_ratio[0]), int(input_size[1]
+                                                                * sampling_ratio[1]), int(input_size[2]*sampling_ratio[2])]
+
+    origin = image_4d.GetOrigin()[:3]
+
+    direction_4d = image_4d.GetDirection()
+    direction_3d = tuple(direction_4d[:3]+direction_4d[4:7]+direction_4d[8:11])
+
+    dimension = 3
+    identity = sitk.Transform(dimension, sitk.sitkIdentity)
+    # set default threader to platform to avoid freezing with MultiProc https://github.com/SimpleITK/SimpleITK/issues/1239
+    sitk.ProcessObject_SetGlobalDefaultThreader('Platform')
+    resampled_list=[]
+    for i in range(input_size[3]):
+        resampled_image = sitk.Resample(image_4d[:,:,:,i], output_size, identity, sitk.sitkLinear,
+                                        origin, output_spacing, direction_3d)
+        resampled_list.append(resampled_image)
+    combined = sitk.JoinSeries(resampled_list) 
+    resampled_4d = copyInfo_4DImage(combined, resampled_image, image_4d)
+
+    if clip_negative:
+        # clip potential negative values
+        array = sitk.GetArrayFromImage(resampled_4d)
+        array[(array < 0).astype(bool)] = 0
+        pos_resampled_image = sitk.GetImageFromArray(array, isVector=False)
+        pos_resampled_image.CopyInformation(resampled_4d)
+        resampled_4d = pos_resampled_image
+    return resampled_4d
 
 
 def copyInfo_4DImage(image_4d, ref_3d, ref_4d):
@@ -115,6 +155,8 @@ class slice_applyTransformsInputSpec(BaseInterfaceInputSpec):
         exists=True, desc="xforms from head motion estimation .csv file")
     resampling_dim = traits.Str(
         desc="Specification for the dimension of resampling.")
+    interpolation = traits.Str(
+        desc="Select the interpolator for antsApplyTransform.")
     rabies_data_type = traits.Int(mandatory=True,
                                   desc="Integer specifying SimpleITK data type.")
 
@@ -166,7 +208,7 @@ class slice_applyTransforms(BaseInterface):
 
             if self.inputs.apply_motcorr:
                 command = f'antsMotionCorrStats -m {motcorr_params} -o motcorr_vol{x}.mat -t {x}'
-                rc = run_command(command)
+                rc,c_out = run_command(command)
 
                 transforms = orig_transforms+[f'motcorr_vol{x}.mat']
                 inverses = orig_inverses+[0]
@@ -174,7 +216,7 @@ class slice_applyTransforms(BaseInterface):
                 transforms = orig_transforms
                 inverses = orig_inverses
 
-            exec_applyTransforms(transforms, inverses, bold_volumes[x], ref_img, warped_vol_fname, mask=False)
+            exec_applyTransforms(transforms, inverses, bold_volumes[x], ref_img, warped_vol_fname, interpolation=self.inputs.interpolation)
             # change image to specified data type
             sitk.WriteImage(sitk.ReadImage(warped_vol_fname,
                                            self.inputs.rabies_data_type), warped_vol_fname)
@@ -186,7 +228,7 @@ class slice_applyTransforms(BaseInterface):
         return {'out_files': getattr(self, 'out_files')}
 
 
-def exec_applyTransforms(transforms, inverses, input_image, ref_image, output_image, mask=False):
+def exec_applyTransforms(transforms, inverses, input_image, ref_image, output_image, interpolation):
     # tranforms is a list of transform files, set in order of call within antsApplyTransforms
     transform_string = ""
     for transform, inverse in zip(transforms, inverses):
@@ -197,13 +239,8 @@ def exec_applyTransforms(transforms, inverses, input_image, ref_image, output_im
         else:
             transform_string += f"-t {transform} "
 
-    if mask:
-        interpolation = 'GenericLabel'
-    else:
-        interpolation = 'BSpline[5]'
-
     command = f'antsApplyTransforms -i {input_image} {transform_string}-n {interpolation} -r {ref_image} -o {output_image}'
-    rc = run_command(command)
+    rc,c_out = run_command(command)
     if not os.path.isfile(output_image):
         raise ValueError(
             "Missing output image. Transform call failed: "+command)
@@ -318,19 +355,21 @@ def run_command(command, verbose = False):
         log.warning(e.output.decode("utf-8"))
         raise
 
-    out = process.stdout.decode("utf-8")
-    if not out == '':
+    c_out = process.stdout.decode("utf-8")
+    if not c_out == '':
         if verbose:
-            log.info(out)
+            log.info(c_out)
         else:
-            log.debug(out)
+            log.debug(c_out)
     if process.stderr is not None:
         if verbose:
             log.info(process.stderr)
         else:
             log.warning(process.stderr)
     rc = process.returncode
-    return rc
+    if len(c_out)>0 and c_out[-1]=='\n': # remove the extra break point, can affect string construction
+        c_out = c_out[:-1] 
+    return rc,c_out
 
 
 def flatten_list(l):
@@ -345,6 +384,71 @@ def flatten_list(l):
         return flattened
     else:
         return l
+
+
+def filter_scan_exclusion(exclusion_list, split_name):
+    # the function removes a list of scan IDs from split_name
+    
+    # exclusion_list: the input provided by the user
+    # split_name: a list of all scan IDs that were found
+    
+    import numpy as np
+    import pandas as pd
+    if os.path.isfile(os.path.abspath(exclusion_list[0])):
+        updated_split_name=[]
+        if not '.nii' in pathlib.Path(exclusion_list[0]).name:
+            # read the file as a .txt
+            exclusion_list = np.array(pd.read_csv(os.path.abspath(exclusion_list[0]), header=None)).flatten()
+        for split in split_name:
+            exclude = False
+            for scan in exclusion_list:
+                if split in scan:
+                    exclude = True
+            if not exclude:
+                updated_split_name.append(split)
+    elif exclusion_list[0]=='none':
+        updated_split_name = split_name
+    else:
+        raise ValueError(f"The --exclusion_ids {exclusion_list} input had improper format. It must the full path to a .txt or .nii files.")
+    
+    if len(updated_split_name)==0:
+        raise ValueError(f"""
+            No scans are left after scan exclusion!
+            """)
+
+    return updated_split_name
+
+
+def filter_scan_inclusion(inclusion_list, split_name):
+    # the function will update the list of scan IDs in split_name to correspond to inclusion/exclusion list
+    
+    # inclusion_list: the input provided by the user
+    # split_name: a list of all scan IDs that were found
+    
+    import numpy as np
+    import pandas as pd
+    if os.path.isfile(os.path.abspath(inclusion_list[0])):
+        updated_split_name=[]
+        if '.nii' in pathlib.Path(inclusion_list[0]).name:
+            for scan in inclusion_list:
+                updated_split_name.append(find_split(scan, split_name))
+        else:
+            # read the file as a .txt
+            inclusion_list = np.array(pd.read_csv(os.path.abspath(inclusion_list[0]), header=None)).flatten()
+            for scan in inclusion_list:
+                updated_split_name.append(find_split(scan, split_name))
+    elif inclusion_list[0]=='all':
+        updated_split_name = split_name
+    else:
+        raise ValueError(f"The --inclusion_ids {inclusion_list} input had improper format. It must the full path to a .txt or .nii files, or 'all' to keep all scans.")
+    return updated_split_name
+
+
+def find_split(scan, split_name):
+    for split in split_name:
+        if split in scan:
+            return split
+    raise ValueError(f"No previous file name is matching {scan}")
 
 
 ######################
@@ -395,3 +499,62 @@ def fill_node_dict(d, key_l, e):
         return d
     else:
         return e
+
+
+######################
+#DEBUGGING
+######################
+
+def generate_token_data(tmppath, number_scans):
+    # this function generates fake scans at low resolution for quick testing and debugging
+
+    os.makedirs(tmppath+'/inputs', exist_ok=True)
+
+    if 'XDG_DATA_HOME' in os.environ.keys():
+        rabies_path = os.environ['XDG_DATA_HOME']+'/rabies'
+    else:
+        rabies_path = os.environ['HOME']+'/.local/share/rabies'
+
+    template = f"{rabies_path}/DSURQE_40micron_average.nii.gz"
+    mask = f"{rabies_path}/DSURQE_40micron_mask.nii.gz"
+    melodic_file = f"{rabies_path}/melodic_IC.nii.gz"
+
+    spacing = (float(1), float(1), float(1))  # resample to 1mmx1mmx1mm
+    resampled_template = resample_image_spacing(sitk.ReadImage(template), spacing)
+    # generate template masks
+    resampled_mask = resample_image_spacing(sitk.ReadImage(mask), spacing)
+    array = sitk.GetArrayFromImage(resampled_mask)
+    array[array < 1] = 0
+    array[array > 1] = 1
+    binarized = sitk.GetImageFromArray(array, isVector=False)
+    binarized.CopyInformation(resampled_mask)
+    sitk.WriteImage(binarized, tmppath+'/inputs/token_mask.nii.gz')
+    array[:, :, :6] = 0
+    binarized = sitk.GetImageFromArray(array, isVector=False)
+    binarized.CopyInformation(resampled_mask)
+    sitk.WriteImage(binarized, tmppath+'/inputs/token_mask_half.nii.gz')
+
+    # generate fake scans from the template
+    array = sitk.GetArrayFromImage(resampled_template)
+    array_4d = np.repeat(array[np.newaxis, :, :, :], 15, axis=0)
+    
+    melodic_img = sitk.ReadImage(melodic_file)
+    network1_map = sitk.GetArrayFromImage(sitk.Resample(melodic_img[:,:,:,5], resampled_template))
+    network2_map = sitk.GetArrayFromImage(sitk.Resample(melodic_img[:,:,:,19], resampled_template))
+    time1 = np.random.normal(0, array_4d.mean()/100, array_4d.shape[0]) # network timecourse; scale is 1% of image intensity
+    time2 = np.random.normal(0, array_4d.mean()/100, array_4d.shape[0]) # network timecourse; scale is 1% of image intensity
+    # creating fake network timeseries
+    network1_time = (np.repeat(network1_map[np.newaxis, :, :, :], 15, axis=0).T*time1).T
+    network2_time = (np.repeat(network2_map[np.newaxis, :, :, :], 15, axis=0).T*time2).T
+
+    for i in range(number_scans):
+        # generate anatomical scan
+        sitk.WriteImage(resampled_template, tmppath+f'/inputs/sub-token{i+1}_T1w.nii.gz')
+        # generate functional scan
+        array_4d_ = array_4d + network1_time + network2_time + np.random.normal(0, array_4d.mean()/ 100, array_4d.shape)  # add gaussian noise; scale is 1% of the mean intensity of the template
+        sitk.WriteImage(sitk.GetImageFromArray(array_4d_, isVector=False),
+                        tmppath+f'/inputs/sub-token{i+1}_bold.nii.gz')
+
+        # necessary to read matrix orientation properly at the analysis stage
+        sitk.WriteImage(copyInfo_4DImage(sitk.ReadImage(tmppath+f'/inputs/sub-token{i+1}_bold.nii.gz'), sitk.ReadImage(tmppath
+                        + f'/inputs/sub-token{i+1}_T1w.nii.gz'), sitk.ReadImage(tmppath+f'/inputs/sub-token{i+1}_bold.nii.gz')), tmppath+f'/inputs/sub-token{i+1}_bold.nii.gz')

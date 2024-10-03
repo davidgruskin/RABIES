@@ -1,14 +1,9 @@
-import os
-import pathlib
-import SimpleITK as sitk
-import numpy as np
 from nipype.interfaces.base import (
     traits, TraitedSpec, BaseInterfaceInputSpec,
     File, BaseInterface
 )
-from rabies.utils import run_command
 
-def prep_bids_iter(layout, bold_only=False):
+def prep_bids_iter(layout, bids_filter, bold_only=False, inclusion_list=['all'], exclusion_list=['none']):
     '''
     This function takes as input a BIDSLayout, and generates iteration lists
     for managing the workflow's iterables depending on whether --bold_only is
@@ -18,7 +13,7 @@ def prep_bids_iter(layout, bold_only=False):
 
     scan_info = []
     split_name = []
-    scan_list = []
+    structural_scan_list = []
     run_iter = {}
     bold_scan_list = []
 
@@ -26,17 +21,34 @@ def prep_bids_iter(layout, bold_only=False):
     if len(subject_list) == 0:
         raise ValueError(
             "No subject information could be retrieved from the BIDS directory. The 'sub-' specification is mandatory.")
-    if not bold_only:
-        anat_bids = layout.get(subject=subject_list, suffix=[
-                               'T2w', 'T1w'], extension=['nii', 'nii.gz'])
-        if len(anat_bids) == 0:
-            raise ValueError(
-                "No anatomical file with the suffix 'T2w' or 'T1w' were found among the BIDS directory.")
-    bold_bids = layout.get(subject=subject_list, suffix=[
-                           'bold'], extension=['nii', 'nii.gz'])
+
+    if not 'subject' in list(bids_filter['func'].keys()):
+        # enforce that only files with subject ID are read
+        bids_filter['func']['subject']=subject_list
+
+    # create the list for all functional images; this is applying all filters from bids_filter
+    bold_bids = layout.get(extension=['nii', 'nii.gz'], **bids_filter['func'])
     if len(bold_bids) == 0:
         raise ValueError(
-            "No functional file with the suffix 'bold' were found among the BIDS directory.")
+            f"No functional file were found respecting the functional BIDS spec: {bids_filter['func']}")
+    
+    # remove subject, session and run; these are used later to target single files
+    bids_filter['func'].pop('subject', None)
+    bids_filter['func'].pop('session', None)
+    bids_filter['func'].pop('run', None)
+
+    # filter inclusion/exclusion lists
+    from rabies.utils import filter_scan_inclusion, filter_scan_exclusion
+    boldname_list=[pathlib.Path(bold.filename).name.rsplit(".nii")[0] for bold in bold_bids]
+    updated_split_name = filter_scan_inclusion(inclusion_list, boldname_list)
+    updated_split_name = filter_scan_exclusion(exclusion_list, updated_split_name)
+    
+    filtered_bold_bids=[]
+    for name in updated_split_name:
+        for bold in bold_bids:
+            if name in bold.filename:
+                filtered_bold_bids.append(bold)
+    bold_bids = filtered_bold_bids
 
     bold_dict = {}
     for bold in bold_bids:
@@ -56,8 +68,8 @@ def prep_bids_iter(layout, bold_only=False):
         if ses not in list(bold_dict[sub].keys()):
             bold_dict[sub][ses] = {}
 
-        bold_list = layout.get(subject=sub, session=ses, run=run, suffix=[
-                               'bold'], extension=['nii', 'nii.gz'], return_type='filename')
+        bold_list = layout.get(subject=sub, session=ses, run=run, 
+                               extension=['nii', 'nii.gz'], return_type='filename',**bids_filter['func'])
         bold_dict[sub][ses][run] = bold_list
 
     # if not bold_only, then the bold_list and run_iter will be a dictionary with keys being the anat filename
@@ -65,16 +77,16 @@ def prep_bids_iter(layout, bold_only=False):
     for sub in list(bold_dict.keys()):
         for ses in list(bold_dict[sub].keys()):
             if not bold_only:
-                anat_list = layout.get(subject=sub, session=ses, suffix=[
-                                       'T2w', 'T1w'], extension=['nii', 'nii.gz'], return_type='filename')
+                anat_list = layout.get(subject=sub, session=ses,
+                                       extension=['nii', 'nii.gz'], return_type='filename',**bids_filter['anat'])
                 if len(anat_list) == 0:
                     raise ValueError(
-                        f'Missing an anatomical image for sub {sub} and ses- {ses}')
+                        f'Missing an anatomical image for sub {sub} and ses- {ses}, and the following BIDS specs: {bids_filter["anat"]}')
                 if len(anat_list) > 1:
                     raise ValueError(
                         f'Duplicate was found for the anatomical file sub- {sub}, ses- {ses}: {str(anat_list)}')
                 file = anat_list[0]
-                scan_list.append(file)
+                structural_scan_list.append(file)
                 filename_template = pathlib.Path(file).name.rsplit(".nii")[0]
                 split_name.append(filename_template)
                 scan_info.append({'subject_id': sub, 'session': ses})
@@ -88,7 +100,7 @@ def prep_bids_iter(layout, bold_only=False):
                 file = bold_list[0]
                 bold_scan_list.append(file)
                 if bold_only:
-                    scan_list.append(file)
+                    structural_scan_list.append(file)
                     filename_template = pathlib.Path(
                         file).name.rsplit(".nii")[0]
                     split_name.append(filename_template)
@@ -97,14 +109,15 @@ def prep_bids_iter(layout, bold_only=False):
                 else:
                     run_iter[filename_template].append(run)
 
-    return split_name, scan_info, run_iter, scan_list, bold_scan_list
+    number_functional_scans = len(bold_scan_list)
+    return split_name, scan_info, run_iter, structural_scan_list, number_functional_scans
 
 
 class BIDSDataGraberInputSpec(BaseInterfaceInputSpec):
     bids_dir = traits.Str(exists=True, mandatory=True,
                           desc="BIDS data directory")
-    suffix = traits.List(exists=True, mandatory=True,
-                         desc="Suffix to search for")
+    bids_filter = traits.Dict(exists=True, mandatory=True,
+                         desc="BIDS specs")
     scan_info = traits.Dict(exists=True, mandatory=True,
                             desc="Info required to find the scan")
     run = traits.Any(exists=True, desc="Run number")
@@ -125,31 +138,27 @@ class BIDSDataGraber(BaseInterface):
     output_spec = BIDSDataGraberOutputSpec
 
     def _run_interface(self, runtime):
-        subject_id = self.inputs.scan_info['subject_id']
-        session = self.inputs.scan_info['session']
         if 'run' in (self.inputs.scan_info.keys()):
             run = self.inputs.scan_info['run']
         else:
             run = self.inputs.run
 
+        bids_filter = self.inputs.bids_filter.copy()
+        bids_filter['subject'] = self.inputs.scan_info['subject_id']
+        bids_filter['session'] = self.inputs.scan_info['session']
+        if not run is None:
+            bids_filter['run'] = run
+
         from bids.layout import BIDSLayout
         layout = BIDSLayout(self.inputs.bids_dir, validate=False)
         try:
-            if run is None: # if there is no run spec to search, don't include it in the search
-                file_list = layout.get(subject=subject_id, session=session, extension=[
-                                  'nii', 'nii.gz'], suffix=self.inputs.suffix, return_type='filename')
-            else:
-                file_list = layout.get(subject=subject_id, session=session, run=run, extension=[
-                                  'nii', 'nii.gz'], suffix=self.inputs.suffix, return_type='filename')
+            file_list = layout.get(extension=['nii', 'nii.gz'], return_type='filename', **bids_filter)
             if len(file_list) > 1:
-                raise ValueError(f'Provided BIDS spec lead to duplicates: \
-                    {str(self.inputs.suffix)} sub-{subject_id} ses-{session} run-{str(run)}')
+                raise ValueError(f'Provided BIDS spec lead to duplicates: {bids_filter}')
             elif len(file_list)==0:
-                raise ValueError(f'No file for found corresponding to the following BIDS spec: \
-                    {str(self.inputs.suffix)} sub-{subject_id} ses-{session} run-{str(run)}')
+                raise ValueError(f'No file for found corresponding to the following BIDS spec: {bids_filter}')
         except:
-            raise ValueError(f'Error with BIDS spec: \
-                    {str(self.inputs.suffix)} sub-{subject_id} ses-{session} run-{str(run)}')
+            raise ValueError(f'Error with BIDS spec: {bids_filter}')
 
         setattr(self, 'out_file', file_list[0])
 
@@ -157,6 +166,29 @@ class BIDSDataGraber(BaseInterface):
 
     def _list_outputs(self):
         return {'out_file': getattr(self, 'out_file')}
+
+
+###WRAPPERS FOR AFNI'S FUNCTIONS; NECESSARY TO PREVENT ISSUES WHEN READING INPUTS/OUTPUTS FROM WORKFLOW GRAPH
+
+def apply_despike(in_file):
+    import pathlib
+    import os
+    from rabies.utils import run_command
+    split = pathlib.Path(in_file).name.rsplit(".nii")[0]
+    out_file = os.path.abspath(f"{split}_despike.nii.gz")
+    command = f'3dDespike -prefix {out_file} {in_file}'
+    rc,c_out = run_command(command)
+    return out_file
+
+def apply_autobox(in_file):
+    import pathlib
+    import os
+    from rabies.utils import run_command
+    split = pathlib.Path(in_file).name.rsplit(".nii")[0]
+    out_file = os.path.abspath(f"{split}_autobox.nii.gz")
+    command = f'3dAutobox -input {in_file} -prefix {out_file} -npad 1'
+    rc,c_out = run_command(command)
+    return out_file
 
 
 def convert_to_RAS(img_file, out_dir=None):
@@ -177,6 +209,53 @@ def convert_to_RAS(img_file, out_dir=None):
                 os.makedirs(out_dir)
         nb.as_closest_canonical(img).to_filename(out_file)
         return out_file
+
+
+def correct_oblique_affine(input):
+    from nipype import logging
+    log = logging.getLogger('nipype.workflow')
+
+    import numpy as np
+    import nibabel as nb
+    img = nb.load(input)
+    # check if the image is oblique
+    if (nb.affines.obliquity(img.affine)!=0).sum()==0:
+        # no axis is oblique, thus don't apply correction
+        log.info(f"The file {input} is not oblique. No corrections applied.")
+        return input
+    
+    log.info(f"The file {input} is considered oblique. The affine matrix is modified.")
+    # nb.affines.obliquity assumes the largest dimension is the one that should correspond to voxel size
+    aff = img.affine
+    new_aff = np.zeros([4,4])
+    vs = nb.affines.voxel_sizes(aff)
+    vs_ratio = np.abs(aff[:-1, :-1] / vs)
+    for ax in [0,1,2]:
+        idx = np.where(vs_ratio[:,ax]==vs_ratio[:,ax].max())[0][0]
+        new_aff[idx,ax]=vs[ax]*np.sign(aff[idx,ax])
+        
+    # copy 4th row/column
+    new_aff[3,:] = aff[3,:]
+    new_aff[:,3] = aff[:,3]
+
+    import pathlib
+    import os
+    split = pathlib.Path(input).name.rsplit(".nii")[0]
+    output = os.path.abspath(f"{split}_2card.nii.gz")
+    nb.Nifti1Image(img.dataobj, new_aff, img.header).to_filename(output)
+    return output
+
+
+def convert_3dWarp(input):
+    import pathlib
+    import os
+    from rabies.utils import run_command
+    # apply AFNI's 3dWarp to convert from oblique to cartesian
+    split = pathlib.Path(input).name.rsplit(".nii")[0]
+    output = os.path.abspath(f"{split}_2card.nii.gz")
+    command = f'3dWarp -oblique2card -prefix {output} {input}'
+    rc = run_command(command)
+    return output
 
 
 def resample_template(template_file, mask_file, file_list, spacing='inputs_defined', rabies_data_type=8):
@@ -216,7 +295,7 @@ def resample_template(template_file, mask_file, file_list, spacing='inputs_defin
     # also resample the brain mask to ensure stable registrations further down
     resampled_mask = os.path.abspath("resampled_mask.nii.gz")
     command = f'antsApplyTransforms -d 3 -i {mask_file} -r {resampled_template} -o {resampled_mask} --verbose -n GenericLabel'
-    rc = run_command(command)
+    rc,c_out = run_command(command)
 
     return resampled_template, resampled_mask
 

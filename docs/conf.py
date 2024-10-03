@@ -22,7 +22,7 @@ copyright = '2019, CoBrALab and Gabriel Desrosiers-Gregoire and Gabriel A. Deven
 author = 'CoBrALab'
 
 # The full version, including alpha/beta/rc tags
-release = '0.4.6'
+release = '0.5.1'
 
 
 # -- General configuration ---------------------------------------------------
@@ -36,8 +36,10 @@ extensions = [
     "sphinx_rtd_dark_mode",
     "sphinx.ext.autosectionlabel",
     "sphinx.ext.todo",
-    'sphinxcontrib.bibtex'
+    'sphinxcontrib.bibtex',
+    'sphinxcontrib.programoutput',
 ]
+
 # to get bibliography
 bibtex_bibfiles = ['_static/refs.bib']
 
@@ -46,10 +48,13 @@ todo_include_todos = False
 
 # Set MyST specific extensions
 myst_enable_extensions = [
-    "tasklist"
+    "tasklist",
+    "amsmath",
+    "dollarmath",
 ]
 
-
+# enable equation rendering inline
+myst_dmath_double_inline = True
 
 # Make sure the target is unique
 autosectionlabel_prefix_document = True

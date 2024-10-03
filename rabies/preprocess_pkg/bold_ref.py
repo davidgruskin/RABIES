@@ -12,6 +12,7 @@ from rabies.utils import copyInfo_4DImage, copyInfo_3DImage, run_command
 from .hmc import antsMotionCorr
 
 def init_bold_reference_wf(opts, name='gen_bold_ref'):
+    # gen_bold_ref_head_start
     """
     The 4D raw EPI file is used to generate a representative volumetric 3D EPI. This volume later becomes the target for 
     motion realignment and the estimation of susceptibility distortions through registration to the structural image. 
@@ -40,6 +41,7 @@ def init_bold_reference_wf(opts, name='gen_bold_ref'):
             ref_image: the reference EPI volume
             bold_file: the input EPI timeseries, but after removing dummy volumes if --detect_dummy is selected
     """
+    # gen_bold_ref_head_end
 
     workflow = pe.Workflow(name=name)
 
@@ -47,7 +49,7 @@ def init_bold_reference_wf(opts, name='gen_bold_ref'):
         fields=['bold_file']), name='inputnode')
 
     outputnode = pe.Node(
-        niu.IdentityInterface(fields=['bold_file', 'ref_image']),
+        niu.IdentityInterface(fields=['ref_image']),
         name='outputnode')
 
     gen_ref = pe.Node(EstimateReferenceImage(HMC_option=opts.HMC_option, detect_dummy=opts.detect_dummy, rabies_data_type=opts.data_type),
@@ -56,9 +58,10 @@ def init_bold_reference_wf(opts, name='gen_bold_ref'):
         'qsub_args': f'-pe smp {str(2*opts.min_proc)}', 'overwrite': True}
 
     workflow.connect([
-        (inputnode, gen_ref, [('bold_file', 'in_file')]),
-        (gen_ref, outputnode, [('ref_image', 'ref_image'),
-                               ('bold_file', 'bold_file')]),
+        (inputnode, gen_ref, [
+            ('bold_file', 'in_file'),
+            ]),
+        (gen_ref, outputnode, [('ref_image', 'ref_image')]),
     ])
 
     return workflow
@@ -66,18 +69,14 @@ def init_bold_reference_wf(opts, name='gen_bold_ref'):
 
 class EstimateReferenceImageInputSpec(BaseInterfaceInputSpec):
     in_file = File(exists=True, mandatory=True, desc="4D EPI file")
-    HMC_option = traits.Str(desc="Select one of the pre-built options from https://github.com/ANTsX/ANTsR/blob/60eefd96fedd16bceb4703ecd2cd5730e6843807/R/ants_motion_estimation.R")
+    HMC_option = traits.Str(desc="Select one of the pre-defined HMC registration command.")
     detect_dummy = traits.Bool(
         desc="specify if should detect and remove dummy scans, and use these volumes as reference image.")
     rabies_data_type = traits.Int(mandatory=True,
                                   desc="Integer specifying SimpleITK data type.")
 
-
 class EstimateReferenceImageOutputSpec(TraitedSpec):
     ref_image = File(exists=True, desc="3D reference image")
-    bold_file = File(
-        exists=True, desc="Input bold file without dummy volumes if detect_dummy is True.")
-
 
 class EstimateReferenceImage(BaseInterface):
     """
@@ -105,7 +104,7 @@ class EstimateReferenceImage(BaseInterface):
         if not in_nii.GetDimension()==4:
             raise ValueError(f"Input image {self.inputs.in_file} is not 4-dimensional.")
 
-        data_slice = sitk.GetArrayFromImage(in_nii)[:50, :, :, :]
+        data_array = sitk.GetArrayFromImage(in_nii)
 
         n_volumes_to_discard = _get_vols_to_discard(in_nii)
 
@@ -117,41 +116,32 @@ class EstimateReferenceImage(BaseInterface):
             log.info("Detected "+str(n_volumes_to_discard)
                   + " dummy scans. Taking the median of these volumes as reference EPI.")
             median_image_data = np.median(
-                data_slice[:n_volumes_to_discard, :, :, :], axis=0)
-
-            out_bold_file = os.path.abspath(
-                f'{filename_split[0]}_cropped_dummy.nii.gz')
-            img_array = sitk.GetArrayFromImage(
-                in_nii)[n_volumes_to_discard:, :, :, :]
-
-            image_4d = copyInfo_4DImage(sitk.GetImageFromArray(
-                img_array, isVector=False), in_nii, in_nii)
-            sitk.WriteImage(image_4d, out_bold_file)
+                data_array[:n_volumes_to_discard, :, :, :], axis=0)
 
         else:
-            out_bold_file = self.inputs.in_file
-
             n_volumes_to_discard = 0
             if self.inputs.detect_dummy:
                 log.info(
                     "Detected no dummy scans. Generating the ref EPI based on multiple volumes.")
-            # if no dummy scans, will generate a median from a subset of max 100
+            # if no dummy scans, will generate a median from a subset of max 50
             # slices of the time series
-            if in_nii.GetSize()[-1] > 100:
+
+            num_timepoints = in_nii.GetSize()[-1]
+            # select a set of 50 frames spread uniformally across time to avoid temporal biases
+            subset_idx = np.linspace(0,num_timepoints-1,50).astype(int)
+            data_slice = data_array[subset_idx,:,:,:]
+            if num_timepoints > 50:
                 slice_fname = os.path.abspath("slice.nii.gz")
                 image_4d = copyInfo_4DImage(sitk.GetImageFromArray(
-                    data_slice[20:100, :, :, :], isVector=False), in_nii, in_nii)
+                    data_slice, isVector=False), in_nii, in_nii)
                 sitk.WriteImage(image_4d, slice_fname)
-                median_fname = os.path.abspath("median.nii.gz")
-                image_3d = copyInfo_3DImage(sitk.GetImageFromArray(
-                    np.median(data_slice[20:100, :, :, :], axis=0), isVector=False), in_nii)
-                sitk.WriteImage(image_3d, median_fname)
             else:
                 slice_fname = self.inputs.in_file
-                median_fname = os.path.abspath("median.nii.gz")
-                image_3d = copyInfo_3DImage(sitk.GetImageFromArray(
-                    np.median(data_slice, axis=0), isVector=False), in_nii)
-                sitk.WriteImage(image_3d, median_fname)
+
+            median_fname = os.path.abspath("median.nii.gz")
+            image_3d = copyInfo_3DImage(sitk.GetImageFromArray(
+                np.median(data_slice, axis=0), isVector=False), in_nii)
+            sitk.WriteImage(image_3d, median_fname)
 
             # First iteration to generate reference image.
             res = antsMotionCorr(in_file=slice_fname,
@@ -182,16 +172,14 @@ class EstimateReferenceImage(BaseInterface):
         # denoise the resulting reference image through non-local mean denoising
         # Denoising reference image.
         command = f'DenoiseImage -d 3 -i {out_ref_fname} -o {out_ref_fname}'
-        rc = run_command(command)
+        rc,c_out = run_command(command)
 
         setattr(self, 'ref_image', out_ref_fname)
-        setattr(self, 'bold_file', out_bold_file)
 
         return runtime
 
     def _list_outputs(self):
-        return {'ref_image': getattr(self, 'ref_image'),
-                'bold_file': getattr(self, 'bold_file')}
+        return {'ref_image': getattr(self, 'ref_image')}
 
 
 def _get_vols_to_discard(img):

@@ -17,8 +17,18 @@ def init_main_analysis_wf(preprocess_opts, cr_opts, analysis_opts):
 
     split_dict, split_name_list, target_list = read_confound_workflow(conf_output, nativespace=cr_opts.nativespace_analysis)
 
-    # update split_name according to the --scan_list option
-    split_name_list = get_iterable_scan_list(analysis_opts.scan_list, split_name_list)
+    if len(split_name_list)==0:
+        raise ValueError(f"""
+            No outputs were founds from the confound correction stage. 
+            All scans may have been removed for not meeting the minimum_timepoint threshold 
+            when applying --frame_censoring. Outputs will be named empty.nii.gz if this is 
+            the case.
+            """)
+
+    # filter inclusion/exclusion lists
+    from rabies.utils import filter_scan_inclusion, filter_scan_exclusion
+    split_name_list = filter_scan_inclusion(analysis_opts.inclusion_ids, split_name_list)
+    split_name_list = filter_scan_exclusion(analysis_opts.exclusion_ids, split_name_list)
 
     # setting up iterables from the BOLD scan splits
     main_split = pe.Node(niu.IdentityInterface(fields=['split_name']),
@@ -97,7 +107,7 @@ def init_main_analysis_wf(preprocess_opts, cr_opts, analysis_opts):
             ])
 
 
-    load_sub_dict_node = pe.Node(Function(input_names=['maps_dict', 'bold_file', 'CR_data_dict', 'VE_file', 'STD_file', 'CR_STD_file', 'random_CR_STD_file', 'corrected_CR_STD_file', 'name_source'],
+    load_sub_dict_node = pe.Node(Function(input_names=['maps_dict', 'bold_file', 'CR_data_dict', 'VE_file', 'STD_file', 'CR_STD_file', 'name_source'],
                                            output_names=[
                                                'dict_file'],
                                        function=load_sub_input_dict),
@@ -110,8 +120,6 @@ def init_main_analysis_wf(preprocess_opts, cr_opts, analysis_opts):
             ("VE_file_path", "VE_file"),
             ("STD_file_path", "STD_file"),
             ("CR_STD_file_path", "CR_STD_file"),
-            ("random_CR_STD_file_path", "random_CR_STD_file"),
-            ("corrected_CR_STD_file_path", "corrected_CR_STD_file"),
             ("input_bold", "name_source"),
             ]),
         (load_maps_dict_node, load_sub_dict_node, [
@@ -161,6 +169,7 @@ def init_main_analysis_wf(preprocess_opts, cr_opts, analysis_opts):
             ("outputnode.NPR_extra_timecourse_csv", "NPR_extra_timecourse_csv"),
             ("outputnode.NPR_prior_filename", "NPR_prior_filename"),
             ("outputnode.NPR_extra_filename", "NPR_extra_filename"),
+            ("outputnode.NPR_optimize_report", "NPR_optimize_report"),
             ]),
         ])
 
@@ -197,12 +206,10 @@ def init_main_analysis_wf(preprocess_opts, cr_opts, analysis_opts):
                 ("outputnode.spatial_VE_nii", "spatial_VE_nii"),
                 ("outputnode.temporal_std_nii", "temporal_std_nii"),
                 ("outputnode.CR_prediction_std_nii", "CR_prediction_std_nii"),
-                ("outputnode.random_CR_std_nii", "random_CR_std_nii"),
-                ("outputnode.corrected_CR_std_nii", "corrected_CR_std_nii"),
                 ("outputnode.GS_cov_nii", "GS_cov_nii"),
                 ]),
             ])
-        if (analysis_opts.NPR_temporal_comp>-1) or (analysis_opts.NPR_spatial_comp>-1):
+        if (analysis_opts.NPR_temporal_comp>-1) or (analysis_opts.NPR_spatial_comp>-1) or analysis_opts.optimize_NPR['apply']:
             workflow.connect([
                 (analysis_wf, prep_analysis_dict_node, [
                     ("outputnode.NPR_prior_timecourse_csv", "NPR_prior_timecourse_csv"),
@@ -273,7 +280,7 @@ def load_maps_dict(mask_file, WM_mask_file, CSF_mask_file, atlas_file, atlas_ref
 
 
 # this function loads subject-specific data
-def load_sub_input_dict(maps_dict, bold_file, CR_data_dict, VE_file, STD_file, CR_STD_file, random_CR_STD_file, corrected_CR_STD_file, name_source):
+def load_sub_input_dict(maps_dict, bold_file, CR_data_dict, VE_file, STD_file, CR_STD_file, name_source):
     import pickle
     import pathlib
     import os
@@ -295,15 +302,10 @@ def load_sub_input_dict(maps_dict, bold_file, CR_data_dict, VE_file, STD_file, C
         sitk.ReadImage(STD_file))[volume_indices]
     predicted_std = sitk.GetArrayFromImage(
         sitk.ReadImage(CR_STD_file))[volume_indices]
-    random_CR_std = sitk.GetArrayFromImage(
-        sitk.ReadImage(random_CR_STD_file))[volume_indices]
-    corrected_CR_std = sitk.GetArrayFromImage(
-        sitk.ReadImage(corrected_CR_STD_file))[volume_indices]
 
     sub_dict = {'bold_file':bold_file, 'name_source':name_source, 'CR_data_dict':CR_data_dict, 
             'timeseries':timeseries, 'VE_spatial':VE_spatial, 'temporal_std':temporal_std,
-            'predicted_std':predicted_std, 'random_CR_std':random_CR_std, 
-            'corrected_CR_std':corrected_CR_std}
+            'predicted_std':predicted_std}
     
     # add all the maps_dict into the sub_dict
     for k in maps_dict.keys():
@@ -318,6 +320,8 @@ def load_sub_input_dict(maps_dict, bold_file, CR_data_dict, VE_file, STD_file, C
 
 
 def read_confound_workflow(conf_output, nativespace=False):
+    from nipype import logging
+    log = logging.getLogger('nipype.workflow')
 
     conf_workflow_file = f'{conf_output}/rabies_confound_correction_workflow.pkl'
 
@@ -331,7 +335,7 @@ def read_confound_workflow(conf_output, nativespace=False):
                     'commonspace_CSF_mask':[preproc_outputnode_name, 'commonspace_CSF_mask'],
                     'commonspace_vascular_mask':[preproc_outputnode_name, 'commonspace_vascular_mask'],
                     'commonspace_labels':[preproc_outputnode_name, 'commonspace_labels'],
-                    'confounds_csv':[preproc_outputnode_name, 'confounds_csv'],
+                    'motion_params_csv':[preproc_outputnode_name, 'motion_params_csv'],
                     'FD_csv':[preproc_outputnode_name, 'FD_csv'],
                     'commonspace_resampled_template':[preproc_outputnode_name, 'commonspace_resampled_template'],
                     'cleaned_path':['confound_correction_main_wf.confound_correction_wf.regress', 'cleaned_path'],
@@ -366,37 +370,27 @@ def read_confound_workflow(conf_output, nativespace=False):
 
     # don't include scans that were removed during confound correction
     corrected_split_name=[]
+    remove_list = []
     import pathlib
     for name in split_name:
         filename = pathlib.Path(split_dict[name]['cleaned_path']).name
         if 'empty' in filename:
+            remove_list.append(name)
             del split_dict[name]
         else:
             corrected_split_name.append(name)
     split_name = corrected_split_name
 
+    if len(remove_list)>0:
+        scan_list_str = ''
+        for name in remove_list:
+            scan_list_str += f'\n        - {name}'
+        log.warning(f"""
+        The following scans were not included for analysis as the file was empty: {scan_list_str}
+        This is likely due to not meeting the minimum_timepoints threshold from --frame_censoring.
+                    """)
+
     return split_dict, split_name, target_list
-
-
-def get_iterable_scan_list(scan_list, split_name):
-    # prep the subset of scans on which the analysis will be run
-    import numpy as np
-    import pandas as pd
-    if os.path.isfile(os.path.abspath(scan_list[0])):
-        updated_split_name=[]
-        if '.nii' in pathlib.Path(scan_list[0]).name:
-            for scan in scan_list:
-                updated_split_name.append(find_split(scan, split_name))
-        else:
-            # read the file as a .txt
-            scan_list = np.array(pd.read_csv(os.path.abspath(scan_list[0]), header=None)).flatten()
-            for scan in scan_list:
-                updated_split_name.append(find_split(scan, split_name))
-    elif scan_list[0]=='all':
-        updated_split_name = split_name
-    else:
-        raise ValueError(f"The --scan_list {scan_list} input had improper format. It must the full path to a .txt or .nii files, or 'all' to keep all scans.")
-    return updated_split_name
 
 
 def find_split(scan, split_name):

@@ -6,11 +6,13 @@ from nipype.interfaces.base import (
 )
 
 def init_inho_correction_wf(opts, image_type, output_folder, num_procs, name='inho_correction_wf'):
+    # inho_correction_head_start
     """
     Corrects an input 3D image for intensity inhomogeneities. The image is denoised with non-local mean 
-    denoising (Manjón et al., 2010) followed by iterative correction for intensity inhomogeneities (Sled 
-    et al., 1998). Initial masking is achieved via intensity thresholding, giving an initial correction of 
-    the image, and a registration is then conducted to register a brain mask for a final round of correction.
+    denoising (Manjón et al., 2010) (for EPIs, denoising was carried beforehand during 3D EPI generation) 
+    followed by iterative correction for intensity inhomogeneities (Sled et al., 1998). Initial masking 
+    is achieved via intensity thresholding, giving an initial correction of the image, and a registration is 
+    then conducted to register a brain mask for a final round of correction.
 
     References:
         Manjón, J. V., Coupé, P., Martí-Bonmatí, L., Collins, D. L., & Robles, M. (2010). Adaptive non-local means 
@@ -57,13 +59,17 @@ def init_inho_correction_wf(opts, image_type, output_folder, num_procs, name='in
                                 combined masks from inhomogeneity correction. This will enhance brain edge-matching, but 
                                 requires good quality masks. This should be selected along the 'masking' option.
                                 *** Specify 'true' or 'false'. 
+                                * keep_mask_after_extract: If using brain_extraction, use the mask to compute the registration metric
+                                within the mask only. Choose to prevent stretching of the images beyond the limit of the brain mask
+                                (e.g. if the moving and target images don't have the same brain coverage).
+                                *** Specify 'true' or 'false'.
                                 * template_registration: Specify a registration script for the alignment of the 
                                 dataset-generated unbiased template to a reference template for masking.
                                 *** Rigid: conducts only rigid registration.
                                 *** Affine: conducts Rigid then Affine registration.
                                 *** SyN: conducts Rigid, Affine then non-linear registration.
                                 *** no_reg: skip registration.
-                                (default: apply=false,masking=false,brain_extraction=false,template_registration=SyN)
+                                (default: apply=false,masking=false,brain_extraction=false,keep_mask_after_extract=false,template_registration=SyN)
                                 
         --bold_inho_cor BOLD_INHO_COR
                                 Same as --anat_inho_cor, but for the EPI images.
@@ -71,7 +77,7 @@ def init_inho_correction_wf(opts, image_type, output_folder, num_procs, name='in
                                 
         --bold_robust_inho_cor BOLD_ROBUST_INHO_COR
                                 Same as --anat_robust_inho_cor, but for the EPI images.
-                                (default: apply=false,masking=false,brain_extraction=false,template_registration=SyN)
+                                (default: apply=false,masking=false,brain_extraction=false,keep_mask_after_extract=false,template_registration=SyN)
                                 
     Workflow:
         parameters
@@ -94,6 +100,7 @@ def init_inho_correction_wf(opts, image_type, output_folder, num_procs, name='in
             denoise_mask: the brain mask resampled on the corrected image
             init_denoise: the image after a first round of correction
     """
+    # inho_correction_head_end
 
     workflow = pe.Workflow(name=name)
 
@@ -124,6 +131,7 @@ def init_inho_correction_wf(opts, image_type, output_folder, num_procs, name='in
             multistage_otsu='true'
         if opts.bold_robust_inho_cor['apply']:
             robust_inho_cor=True
+            robust_inho_cor_opts=opts.bold_robust_inho_cor
             commonspace_wf_name='bold_robust_inho_cor_template'
             if not opts.bold_only:
                 joinsource_list = ['run_split', 'main_split']
@@ -137,6 +145,7 @@ def init_inho_correction_wf(opts, image_type, output_folder, num_procs, name='in
             multistage_otsu='true'
         if opts.anat_robust_inho_cor['apply']:
             robust_inho_cor=True
+            robust_inho_cor_opts=opts.anat_robust_inho_cor
             commonspace_wf_name='anat_robust_inho_cor_template'
             joinsource_list = ['main_split']
     else:
@@ -150,7 +159,9 @@ def init_inho_correction_wf(opts, image_type, output_folder, num_procs, name='in
                             name='init_InhoCorrection', mem_gb=0.6*opts.scale_min_memory)
 
         from .commonspace_reg import init_commonspace_reg_wf
-        commonspace_reg_wf = init_commonspace_reg_wf(opts=opts, commonspace_masking=opts.bold_robust_inho_cor['masking'], brain_extraction=opts.bold_robust_inho_cor['brain_extraction'], template_reg=opts.bold_robust_inho_cor['template_registration'], fast_commonspace=False, output_folder=output_folder, transforms_datasink=None, num_procs=num_procs, output_datasinks=False, joinsource_list=joinsource_list, name=commonspace_wf_name)
+        commonspace_reg_wf = init_commonspace_reg_wf(opts=opts, commonspace_masking=robust_inho_cor_opts['masking'], brain_extraction=robust_inho_cor_opts['brain_extraction'], keep_mask_after_extract=robust_inho_cor_opts['keep_mask_after_extract'], 
+                                                     template_reg=robust_inho_cor_opts['template_registration'], fast_commonspace=False, inherit_unbiased=False, output_folder=output_folder, 
+                                                     transforms_datasink=None, num_procs=num_procs, output_datasinks=False, joinsource_list=joinsource_list, name=commonspace_wf_name)
 
         workflow.connect([
             (inputnode, init_inho_cor_node, [
@@ -274,7 +285,7 @@ class InhoCorrection(BaseInterface):
             else:
                 raise ValueError(f"Image type must be 'EPI' or 'structural', {self.inputs.image_type}")
             command = f'{processing_script} {target_img} {corrected} {self.inputs.anat_ref} {self.inputs.anat_mask} {self.inputs.inho_cor_method} {self.inputs.multistage_otsu} {str(self.inputs.otsu_threshold)}'
-            rc = run_command(command)
+            rc,c_out = run_command(command)
 
             resampled_mask = corrected.split('.nii.gz')[0]+'_mask.nii.gz'
             init_denoise = corrected.split('.nii.gz')[0]+'_init_denoise.nii.gz'
@@ -294,25 +305,25 @@ class InhoCorrection(BaseInterface):
                 input_anat = target_img
 
                 command = 'ImageMath 3 null_mask.nii.gz ThresholdAtMean %s 0' % (input_anat)
-                rc = run_command(command)
+                rc,c_out = run_command(command)
                 command = 'ImageMath 3 thresh_mask.nii.gz ThresholdAtMean %s 1.2' % (input_anat)
-                rc = run_command(command)
+                rc,c_out = run_command(command)
 
                 command = 'N4BiasFieldCorrection -d 3 -s 4 -i %s -b [20] -c [200x200x200,0.0] -w thresh_mask.nii.gz -x null_mask.nii.gz -o N4.nii.gz' % (input_anat)
-                rc = run_command(command)
+                rc,c_out = run_command(command)
                 command = 'DenoiseImage -d 3 -i N4.nii.gz -o denoise.nii.gz'
-                rc = run_command(command)
+                rc,c_out = run_command(command)
 
                 from rabies.preprocess_pkg.registration import run_antsRegistration
                 [affine, warp, inverse_warp, warped_image] = run_antsRegistration(reg_method='Affine', moving_image=input_anat, fixed_image=self.inputs.anat_ref, fixed_mask=self.inputs.anat_mask)
 
                 command = 'antsApplyTransforms -d 3 -i %s -t [%s,1] -r %s -o resampled_mask.nii.gz -n GenericLabel' % (self.inputs.anat_mask, affine, input_anat)
-                rc = run_command(command)
+                rc,c_out = run_command(command)
 
                 command = 'N4BiasFieldCorrection -d 3 -s 2 -i %s -b [20] -c [200x200x200x200,0.0] -w resampled_mask.nii.gz -r 1 -x null_mask.nii.gz -o N4.nii.gz' % (input_anat)
-                rc = run_command(command)
+                rc,c_out = run_command(command)
                 command = 'DenoiseImage -d 3 -i N4.nii.gz -o %s' % (corrected)
-                rc = run_command(command)
+                rc,c_out = run_command(command)
 
                 # resample image to specified data format
                 sitk.WriteImage(sitk.ReadImage(corrected, self.inputs.rabies_data_type), corrected)
@@ -409,7 +420,7 @@ class OtsuEPIBiasCorrection(BaseInterface):
         [affine, warp, inverse_warp, warped_image] = run_antsRegistration(reg_method='Rigid', moving_image=cwd+'/corrected_iter2.nii.gz', fixed_image=self.inputs.anat, fixed_mask=self.inputs.anat_mask)
 
         command = 'antsApplyTransforms -d 3 -i %s -t [%s,1] -r %s -o %s -n GenericLabel' % (self.inputs.anat_mask, affine, cwd+'/corrected_iter2.nii.gz',resampled_mask)
-        rc = run_command(command)
+        rc,c_out = run_command(command)
 
         otsu_bias_cor(target=bias_cor_input, otsu_ref=cwd+'/corrected_iter2.nii.gz', out_name=cwd+'/final_otsu.nii.gz', b_value=b_value, mask=resampled_mask)
 
@@ -441,9 +452,9 @@ def otsu_bias_cor(target, otsu_ref, out_name, b_value, mask=None, n_iter=200):
     import SimpleITK as sitk
     from rabies.utils import run_command
     command = 'ImageMath 3 null_mask.nii.gz ThresholdAtMean %s 0' % (otsu_ref)
-    rc = run_command(command)
+    rc,c_out = run_command(command)
     command = 'ThresholdImage 3 %s otsu_weight.nii.gz Otsu 4' % (otsu_ref)
-    rc = run_command(command)
+    rc,c_out = run_command(command)
 
     otsu_img = sitk.ReadImage(
         'otsu_weight.nii.gz', sitk.sitkUInt8)
@@ -482,16 +493,16 @@ def otsu_bias_cor(target, otsu_ref, out_name, b_value, mask=None, n_iter=200):
     sitk.WriteImage(mask_img, 'mask1234.nii.gz')
 
     command = 'N4BiasFieldCorrection -d 3 -i %s -b %s -s 1 -c [%sx%sx%s,1e-4] -w mask12.nii.gz -x null_mask.nii.gz -o corrected1.nii.gz' % (target, str(b_value), str(n_iter),str(n_iter),str(n_iter),)
-    rc = run_command(command)
+    rc,c_out = run_command(command)
 
     command = 'N4BiasFieldCorrection -d 3 -i corrected1.nii.gz -b %s -s 1 -c [%sx%sx%s,1e-4] -w mask34.nii.gz -x null_mask.nii.gz -o corrected2.nii.gz' % (str(b_value), str(n_iter),str(n_iter),str(n_iter),)
-    rc = run_command(command)
+    rc,c_out = run_command(command)
 
     command = 'N4BiasFieldCorrection -d 3 -i corrected2.nii.gz -b %s -s 1 -c [%sx%sx%s,1e-4] -w mask123.nii.gz -x null_mask.nii.gz -o corrected3.nii.gz' % (str(b_value), str(n_iter),str(n_iter),str(n_iter),)
-    rc = run_command(command)
+    rc,c_out = run_command(command)
 
     command = 'N4BiasFieldCorrection -d 3 -i corrected3.nii.gz -b %s -s 1 -c [%sx%sx%s,1e-4] -w mask234.nii.gz -x null_mask.nii.gz -o corrected4.nii.gz' % (str(b_value), str(n_iter),str(n_iter),str(n_iter),)
-    rc = run_command(command)
+    rc,c_out = run_command(command)
 
     command = 'N4BiasFieldCorrection -d 3 -i corrected4.nii.gz -b %s -s 1 -c [%sx%sx%s,1e-4] -w mask1234.nii.gz -x null_mask.nii.gz -o %s' % (str(b_value), str(n_iter),str(n_iter),str(n_iter),out_name,)
-    rc = run_command(command)
+    rc,c_out = run_command(command)

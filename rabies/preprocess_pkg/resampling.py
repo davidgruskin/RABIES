@@ -9,6 +9,7 @@ from .bold_ref import init_bold_reference_wf
 from rabies.utils import slice_applyTransforms, Merge
 
 def init_bold_preproc_trans_wf(opts, resampling_dim, name='bold_native_trans_wf'):
+    # resampling_head_start
     """
     This workflow carries out the resampling of the original EPI timeseries into preprocessed timeseries.
     This is accomplished by applying at each frame a combined transform which accounts for previously estimated 
@@ -64,6 +65,7 @@ def init_bold_preproc_trans_wf(opts, resampling_dim, name='bold_native_trans_wf'
             vascular_mask: the vascular mask resampled onto preprocessed EPI timeseries
             labels: the atlas labels resampled onto preprocessed EPI timeseries
     """
+    # resampling_head_end
 
     workflow = pe.Workflow(name=name)
     inputnode = pe.Node(niu.IdentityInterface(fields=[
@@ -82,6 +84,7 @@ def init_bold_preproc_trans_wf(opts, resampling_dim, name='bold_native_trans_wf'
         rabies_data_type=opts.data_type), name='bold_transform', mem_gb=1*opts.scale_min_memory)
     bold_transform.inputs.apply_motcorr = (not opts.apply_slice_mc)
     bold_transform.inputs.resampling_dim = resampling_dim
+    bold_transform.inputs.interpolation = opts.interpolation
 
     merge = pe.Node(Merge(rabies_data_type=opts.data_type, clip_negative=True), name='merge', mem_gb=4*opts.scale_min_memory)
     merge.plugin_args = {
@@ -222,7 +225,7 @@ class MaskEPI(BaseInterface):
         else:
             new_mask_path = os.path.abspath(f'{filename_split[0]}_{self.inputs.name_spec}.nii.gz')
 
-        exec_applyTransforms(self.inputs.transforms, self.inputs.inverses, self.inputs.mask, self.inputs.ref_EPI, new_mask_path, mask=True)
+        exec_applyTransforms(self.inputs.transforms, self.inputs.inverses, self.inputs.mask, self.inputs.ref_EPI, new_mask_path, interpolation='GenericLabel')
         sitk.WriteImage(sitk.ReadImage(
             new_mask_path, sitk.sitkInt16), new_mask_path)
 
